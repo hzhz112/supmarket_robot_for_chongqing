@@ -1,0 +1,13 @@
+# Ignore everything in this directory by default.
+*
+
+# Keep this ignore file itself.
+!.gitignore
+
+# Allow the scripts directory and its contents.
+!scripts/
+!scripts/**
+
+# Allow the robot debug console and its contents.
+!robot_debug_console/
+!robot_debug_console/**
