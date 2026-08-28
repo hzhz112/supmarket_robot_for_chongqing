@@ -11,3 +11,7 @@
 # Allow the robot debug console and its contents.
 !robot_debug_console/
 !robot_debug_console/**
+
+# Allow the robot debug console and its contents.
+!weight/
+!weight/**
