@@ -26,7 +26,7 @@ for candidate in (
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 import rclpy
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, Twist
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, UInt8
@@ -41,13 +41,15 @@ LEFT_ARM_JOINTS = ARM_JOINTS[:7]
 RIGHT_ARM_JOINTS = ARM_JOINTS[7:]
 LEG_JOINTS = ("ankle_joint", "knee_joint", "hip_pitch_joint", "hip_yaw_joint")
 LEG_POWER_READY = 39
-RIGHT_HAND_GRASP_LABELS = {"guazi", "pai", "cui"}
+RIGHT_HAND_GRASP_LABELS = {"guazi", "xiangzi", "pai", "cui"}
+RIGHT_HAND_TCP_Y_OFFSET_M = -0.10
+RIGHT_HAND_PREGRASP_DISTANCE_M = 0.10
 RECORD_IDLE_SECONDS = 2.0
 JOINT_IDLE_EPS_RAD = math.radians(0.2)
 CART_IDLE_POS_EPS_M = 0.002
 CART_IDLE_ROT_EPS_RAD = math.radians(1.0)
 RESET_LEFT_ARM_DEG = (17.7, 22.5, -6.6, -106.8, -18.6, -17.1, 0.0)
-RESET_RIGHT_ARM_DEG = (-26.0, -7.1, 28.5, 110.0, 15.8, 34.5, -4.7)
+RESET_RIGHT_ARM_DEG = (-18.8, -29.5, 9.6, 103.0, 23.9, 19.3, -4.0)
 L1 = 0.375
 L2 = 0.365
 L3 = 0.0
@@ -308,6 +310,10 @@ class RobotBackend(QtCore.QObject):
                 float(payload["vel"]),
             )
             return
+        if action == "base_cmd":
+            self.log_line.emit("[CMD] base cmd sent")
+            node.publish_base_cmd(float(payload["linear_x"]), float(payload["angular_z"]))
+            return
         raise ValueError(f"unknown action: {action}")
 
 
@@ -332,6 +338,7 @@ class RobotDebugNode(Node):
         self._arm_axis_pub = self.create_publisher(Robotarmservomsg, "/arm_axis_position_cmd", 10)
         self._leg_joint_pub = self.create_publisher(Robotlegjoint, "/leg_joint_position_cmd", 10)
         self._leg_axis_pub = self.create_publisher(Robotservomsg, "/axis_position_cmd", 10)
+        self._base_pub = self.create_publisher(Twist, "/car_cmd_vel", 10)
 
         self._power_client = self.create_client(SetRobotPower, "/set_robot_power")
         self._arm_joint_client = self.create_client(JointAbsoluteControl, "/arm_absolute_control")
@@ -512,6 +519,12 @@ class RobotDebugNode(Node):
         msg.vel = float(vel)
         self._leg_axis_pub.publish(msg)
 
+    def publish_base_cmd(self, linear_x: float, angular_z: float) -> None:
+        msg = Twist()
+        msg.linear.x = float(linear_x)
+        msg.angular.z = float(angular_z)
+        self._base_pub.publish(msg)
+
 
 class JointPanel(QtWidgets.QGroupBox):
     def __init__(self, title: str, joint_names: tuple[str, ...]) -> None:
@@ -580,6 +593,98 @@ class CartesianPanel(QtWidgets.QGroupBox):
             self._fields["pitch"].value(),
             self._fields["yaw"].value(),
         )
+
+
+class BaseTeleopPanel(QtWidgets.QGroupBox):
+    def __init__(self, backend: RobotBackend) -> None:
+        super().__init__("底盘键盘控制")
+        self._backend = backend
+        self._pressed: set[int] = set()
+        self._last_active = False
+        self._linear_speed = 0.20
+        self._angular_speed = 0.70
+
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.setAttribute(QtCore.Qt.WA_InputMethodEnabled, False)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self.tip_label = QtWidgets.QLabel("点击本页后，按住 W/A/S/D 控制底盘，松开自动停止。")
+        self.tip_label.setWordWrap(True)
+        self.state_label = QtWidgets.QLabel("当前：停止")
+        self.state_label.setWordWrap(True)
+        self.log_view = QtWidgets.QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.log_view.setMaximumHeight(120)
+        layout.addWidget(self.tip_label)
+        layout.addWidget(self.state_label)
+        layout.addWidget(self.log_view)
+        layout.addStretch(1)
+
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(50)
+
+    def _pressed_names(self) -> str:
+        mapping = {
+            QtCore.Qt.Key_W: "W",
+            QtCore.Qt.Key_A: "A",
+            QtCore.Qt.Key_S: "S",
+            QtCore.Qt.Key_D: "D",
+        }
+        names = [mapping[key] for key in sorted(self._pressed) if key in mapping]
+        return "+".join(names) if names else "--"
+
+    def _publish(self, linear_x: float, angular_z: float) -> None:
+        self._backend.send("base_cmd", linear_x=linear_x, angular_z=angular_z)
+
+    def _tick(self) -> None:
+        forward = (QtCore.Qt.Key_W in self._pressed) - (QtCore.Qt.Key_S in self._pressed)
+        turn = (QtCore.Qt.Key_A in self._pressed) - (QtCore.Qt.Key_D in self._pressed)
+        linear_x = self._linear_speed * float(forward)
+        angular_z = self._angular_speed * float(turn)
+        active = bool(forward or turn)
+        if active:
+            self._publish(linear_x, angular_z)
+        elif self._last_active:
+            self._publish(0.0, 0.0)
+        self._last_active = active
+        self.state_label.setText(
+            f"当前：{self._pressed_names()} | linear.x={linear_x:+.2f} m/s | angular.z={angular_z:+.2f} rad/s"
+        )
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # type: ignore[override]
+        if event.isAutoRepeat():
+            event.accept()
+            return
+        if event.key() in {QtCore.Qt.Key_W, QtCore.Qt.Key_A, QtCore.Qt.Key_S, QtCore.Qt.Key_D}:
+            self._pressed.add(int(event.key()))
+            self._tick()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event: QtGui.QKeyEvent) -> None:  # type: ignore[override]
+        if event.isAutoRepeat():
+            event.accept()
+            return
+        if event.key() in {QtCore.Qt.Key_W, QtCore.Qt.Key_A, QtCore.Qt.Key_S, QtCore.Qt.Key_D}:
+            self._pressed.discard(int(event.key()))
+            self._tick()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def focusOutEvent(self, event: QtGui.QFocusEvent) -> None:  # type: ignore[override]
+        self._pressed.clear()
+        self._last_active = False
+        self._publish(0.0, 0.0)
+        self.state_label.setText("当前：停止")
+        super().focusOutEvent(event)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # type: ignore[override]
+        self.setFocus()
+        super().mousePressEvent(event)
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -1015,6 +1120,10 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self._cart_record_request_time = 0.0
         self._cart_record_last_values: Optional[tuple[float, ...]] = None
         self._cart_record_idle_since: Optional[float] = None
+        self._right_dplus_joint_timer: Optional[QtCore.QTimer] = None
+        self._right_dplus_joint_pending = False
+        self._right_dplus_joint_started_at = 0.0
+        self._right_dplus_original_joints: Optional[tuple[float, ...]] = None
         self._camera_color_image = None
         self._camera_depth_m = None
         self._camera_intrinsics: Optional[tuple[float, float, float, float, float, str]] = None
@@ -1034,8 +1143,10 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self._grasp_target_arm: Optional[str] = None
         self._grasp_position = None
         self._grasp_approach_axis = None
+        self._grasp_contact_axis = None
         self._grasp_rotation = None
         self._grasp_pregrasp_distance_m: Optional[float] = None
+        self._grasp_right_side_mode = False
         self._post_grasp_reset_timer: Optional[QtCore.QTimer] = None
         self._post_grasp_leg_lift_timer: Optional[QtCore.QTimer] = None
         self._post_grasp_reset_stage = 0
@@ -1102,9 +1213,11 @@ class DmpMainWindow(QtWidgets.QMainWindow):
 
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self._build_joint_page(), "关节 / 笛卡尔控制")
+        self.tabs.addTab(self._build_base_teleop_page(), "底盘 WSAD")
         self.tabs.addTab(self._build_cartesian_page(), "DMP（关节 / 笛卡尔）")
         self.tabs.addTab(self._build_vision_page(), "视觉 YOLO")
         self.tabs.addTab(self._build_grasp_page(), "瓶子抓取")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         outer.addWidget(self.tabs, 1)
         root.addWidget(self.left_panel, 1)
 
@@ -1232,6 +1345,19 @@ class DmpMainWindow(QtWidgets.QMainWindow):
 
         layout.addStretch(1)
         return page
+
+    def _build_base_teleop_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(page)
+        self.base_teleop_panel = BaseTeleopPanel(self._backend)
+        layout.addWidget(self.base_teleop_panel)
+        layout.addStretch(1)
+        return page
+
+    def _on_tab_changed(self, index: int) -> None:
+        widget = self.tabs.widget(index)
+        if widget is not None and hasattr(self, "base_teleop_panel") and widget is self.base_teleop_panel.parentWidget():
+            self.base_teleop_panel.setFocus()
 
     def _build_cartesian_page(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -1362,6 +1488,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         WEIGHT_DIR = ROOT / "weight"
         model_choices = (
             ("best.pt（自定义 guazi）", WEIGHT_DIR / "best.pt"),
+            ("best_xiangzi.pt（自定义 xiangzi）", WEIGHT_DIR / "best_xiangzi.pt"),
             ("yolo26n-seg.pt（COCO，含 bottle）", WEIGHT_DIR / "yolo26n-seg.pt"),
             ("ear.pt（ear）", WEIGHT_DIR / "ear.pt"),
             ("guazi）.pt）", WEIGHT_DIR / "guazi）.pt"),
@@ -1373,7 +1500,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self.vision_model_combo.currentIndexChanged.connect(self._on_vision_model_changed)
         self.vision_class_combo = QtWidgets.QComboBox()
         self.vision_class_combo.setEditable(True)
-        self.vision_class_combo.addItems(["guazi", "bottle", "ear"])
+        self.vision_class_combo.addItems(["guazi", "xiangzi", "bottle", "ear"])
         self.vision_class_combo.setCurrentText("guazi")
         self.vision_class_combo.setToolTip("可输入具体标签或 all；右手标签会自动强制右臂，其余标签按当前手臂抓取")
         self.vision_detect_btn = QtWidgets.QPushButton("识别并输出坐标")
@@ -1429,6 +1556,8 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             model_name = Path(model_path).name
             if model_name == "best.pt":
                 default_class = "guazi"
+            elif model_name == "best_xiangzi.pt":
+                default_class = "xiangzi"
             elif model_name == "ear.pt":
                 default_class = "ear"
             else:
@@ -1445,7 +1574,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
 
         根据视觉标签自动分流：
         1. bottle：沿用瓶身中上部、正面接近的抓取方式。
-        2. guazi：取物体最右侧中部，从右侧水平接近。
+        2. guazi / xiangzi：取物体最右侧中部，从右侧水平接近。
 
         生成姿态不会移动机械臂；运动仍由两个独立按钮控制。
         """
@@ -1478,13 +1607,14 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self.grasp_contact_gap_spin = QtWidgets.QDoubleSpinBox()
         self.grasp_contact_gap_spin.setRange(1.0, 20.0)
         self.grasp_contact_gap_spin.setSingleStep(1.0)
-        self.grasp_contact_gap_spin.setValue(10.0)
+        self.grasp_contact_gap_spin.setValue(5.0)
         self.grasp_contact_gap_spin.setSuffix(" cm")
         self.grasp_contact_gap_spin.setToolTip("相对步长：向前/向左移动多少厘米")
         self.grasp_generate_btn = QtWidgets.QPushButton("生成预抓取姿态")
         self.grasp_dmp_pre_btn = QtWidgets.QPushButton("D+预")
         self.grasp_align_btn = QtWidgets.QPushButton("调整到抓取位置")
-        self.grasp_forward_btn = QtWidgets.QPushButton("相对向前移动")
+        self.grasp_forward_btn = QtWidgets.QPushButton("沿当前 TCP +X 前进")
+        self.grasp_forward_btn.setToolTip("按当前末端姿态的局部 +X 方向推进")
         self.grasp_backward_btn = QtWidgets.QPushButton("向后移动")
         self.grasp_generate_btn.clicked.connect(self._generate_grasp_pose)
         self.grasp_dmp_pre_btn.clicked.connect(self._play_guazi_dmp_then_pregrasp)
@@ -1507,7 +1637,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         controls.addWidget(self.grasp_backward_btn, 2, 3, 1, 2)
         layout.addWidget(control_box)
 
-        final_box = QtWidgets.QGroupBox("最终抓取动作")
+        final_box = QtWidgets.QGroupBox("灵巧手独立开合")
         final_layout = QtWidgets.QGridLayout(final_box)
         self.final_o7_port_input = QtWidgets.QLineEdit(O7_RS485_PORT)
         self.final_gripper_port_input = QtWidgets.QLineEdit(LEFT_GRIPPER_PORT)
@@ -1519,7 +1649,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self.final_left_lift_reset_btn = QtWidgets.QPushButton("左手抬起+复位")
         self.final_right_place_btn = QtWidgets.QPushButton("右手放置")
         self.final_left_place_btn = QtWidgets.QPushButton("左手放置")
-        self.final_action_status = QtWidgets.QLabel("等待你到达最终抓取点")
+        self.final_action_status = QtWidgets.QLabel("等待你操作灵巧手")
         self.final_action_status.setWordWrap(True)
         self.final_o7_close_btn.clicked.connect(self._run_right_hand_grasp)
         self.final_o7_open_btn.clicked.connect(self._run_right_hand_open)
@@ -1591,7 +1721,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         if hasattr(self, "final_left_place_btn"):
             self.final_left_place_btn.setEnabled(not busy)
         if hasattr(self, "final_action_status"):
-            self.final_action_status.setText("运行中..." if busy else "等待你到达最终抓取点")
+            self.final_action_status.setText("运行中..." if busy else "等待你操作灵巧手")
 
     def _final_grasp_process_finished(self, code: int, _status: QtCore.QProcess.ExitStatus) -> None:
         process = self._grasp_process
@@ -1835,6 +1965,18 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             float(yaw),
         )
 
+    def _offset_pose_car_link(self, pose: tuple[float, ...], dx: float, dy: float, dz: float) -> tuple[float, ...]:
+        """按 car_link 坐标直接偏移一个绝对位姿。"""
+        x, y, z, roll, pitch, yaw = pose
+        return (
+            float(x + dx),
+            float(y + dy),
+            float(z + dz),
+            float(roll),
+            float(pitch),
+            float(yaw),
+        )
+
     def _generate_grasp_pose(self) -> None:
         """根据目标标签生成预抓取 TCP 位姿，但不发送运动命令。"""
         import numpy as np
@@ -1847,26 +1989,45 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             snap = self._backend.snapshot()
             arm = self.grasp_arm_combo.currentText()
             current_pose = snap.left_ee if arm == "left" else snap.right_ee
+            # /arm_tcp_pose 已经是 car_link 下的 TCP 位姿，不能再套 car_from_body。
             current_tcp = np.array(self._pose_xyzrpy(current_pose, f"{arm} TCP")[:3], dtype=np.float64)
-            if target.get("points_car") is None:
+            points_car_value = target.get("points_car")
+            # 识别时 TF 可能尚未更新；生成抓取时用最新 TF 从已缓存的 body 点云重算。
+            if points_car_value is None and target.get("points_base") is not None:
+                latest_snap = self._backend.snapshot()
+                if latest_snap.car_from_body is not None:
+                    points_base = np.asarray(target["points_base"], dtype=np.float64)
+                    points_base_h = np.column_stack(
+                        (points_base, np.ones((len(points_base), 1), dtype=np.float64))
+                    )
+                    points_car_value = (
+                        np.asarray(latest_snap.car_from_body, dtype=np.float64)
+                        @ points_base_h.T
+                    ).T[:, :3]
+                    target["points_car"] = points_car_value
+                    self.append_log("[GRASP] 识别时 car_link TF 未就绪，已用最新 TF 重算目标点云")
+            if points_car_value is None:
                 raise ValueError(
-                    "没有 car_link 点云，请先确认相机外参和 "
-                    "car_link <- body_link TF 都可用"
+                    "没有 car_link 点云：请确认相机外参已加载，并等待 "
+                    "car_link <- body_link TF 就绪后重新识别"
                 )
-            points_car = np.asarray(target["points_car"], dtype=np.float64)
+            points_car = np.asarray(points_car_value, dtype=np.float64)
             if points_car.shape[0] < 20:
                 raise ValueError("目标有效三维点太少")
 
-            class_name = str(target.get("class_name", "")).strip().lower()
             self._grasp_target_arm = arm
-            if arm == "right":
-                self._generate_side_grasp_pose(target, points_car, current_tcp, class_name, arm)
-            else:
-                self._generate_bottle_grasp_pose(target, points_car, current_tcp)
+            # 左右手使用完全相同的抓取计算：目标点、水平接近向量和 TCP +X 都一致。
+            self._generate_bottle_grasp_pose(
+                target,
+                points_car,
+                current_tcp,
+                side_offset_m=RIGHT_HAND_TCP_Y_OFFSET_M if arm == "right" else 0.0,
+            )
         except Exception as exc:
             self._grasp_target = None
             self._grasp_contact_target = None
             self._grasp_target_arm = None
+            self._grasp_right_side_mode = False
             self.grasp_result_label.setText(f"生成预抓取姿态失败: {exc}")
             self.append_log(f"[GRASP] 生成失败: {exc}")
 
@@ -1918,7 +2079,6 @@ class DmpMainWindow(QtWidgets.QMainWindow):
 
         if (
             self._grasp_position is None
-            or self._grasp_approach_axis is None
             or self._grasp_rotation is None
             or self._grasp_pregrasp_distance_m is None
         ):
@@ -1932,9 +2092,13 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             raise ValueError("最终离目标距离必须小于预抓取距离")
 
         grasp_position = np.asarray(self._grasp_position, dtype=np.float64)
-        x_axis = np.asarray(self._grasp_approach_axis, dtype=np.float64)
         rotation = np.asarray(self._grasp_rotation, dtype=np.float64)
-        forward_target_position = grasp_position - x_axis * final_gap_m
+        if self._grasp_right_side_mode:
+            forward_target_position = grasp_position.copy()
+            forward_target_position[1] -= final_gap_m
+        else:
+            x_axis = np.asarray(self._grasp_contact_axis, dtype=np.float64)
+            forward_target_position = grasp_position - x_axis * final_gap_m
         roll, pitch, yaw = rotation_matrix_to_rpy(rotation)
         self._grasp_contact_target = (
             float(forward_target_position[0]),
@@ -1951,8 +2115,13 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         target: dict[str, Any],
         points_car: "np.ndarray",
         current_tcp: "np.ndarray",
+        side_offset_m: float = 0.0,
+        right_side_mode: bool = False,
     ) -> None:
-        """通用逻辑：抓目标中上部，沿当前水平接近方向运动。"""
+        """通用逻辑：抓目标中上部，沿当前水平接近方向运动。
+
+        side_offset_m 是通用模式下 TCP 局部坐标系的 Y 偏移；右手侧向模式不使用它。
+        """
         import numpy as np
 
         # 取瓶子 car_link 坐标系 Z 方向的 2%/98% 范围，降低深度离群点影响。
@@ -1994,9 +2163,86 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self._grasp_position = grasp_position.copy()
         self._grasp_approach_axis = x_axis.copy()
         self._grasp_rotation = rotation.copy()
-        self._grasp_pregrasp_distance_m = float(self.grasp_forward_spin.value())
-        self._grasp_target, self._grasp_contact_target, pregrasp_position, forward_target_position = (
-            self._make_grasp_targets(grasp_position, x_axis, rotation, final_gap_m)
+        pregrasp_distance_m = float(self.grasp_forward_spin.value())
+        self._grasp_right_side_mode = bool(right_side_mode)
+        if right_side_mode:
+            if pregrasp_distance_m <= 0.10:
+                raise ValueError("预抓取距离必须大于 0.10 m")
+            if final_gap_m <= 0.0:
+                raise ValueError("最终离目标距离必须大于 0")
+            if final_gap_m >= pregrasp_distance_m:
+                raise ValueError("最终离目标距离必须小于预抓取距离")
+            self._grasp_contact_axis = None
+            self._grasp_pregrasp_distance_m = pregrasp_distance_m
+            grasp_pose = (
+                float(grasp_position[0]),
+                float(grasp_position[1]),
+                float(grasp_position[2]),
+                float(roll),
+                float(pitch),
+                float(yaw),
+            )
+            pregrasp_position = self._offset_pose_car_link(grasp_pose, 0.0, -pregrasp_distance_m, 0.0)
+            forward_target_position = self._offset_pose_car_link(grasp_pose, 0.0, -final_gap_m, 0.0)
+            self._grasp_target = (
+                float(pregrasp_position[0]),
+                float(pregrasp_position[1]),
+                float(pregrasp_position[2]),
+                float(roll),
+                float(pitch),
+                float(yaw),
+            )
+            self._grasp_contact_target = (
+                float(forward_target_position[0]),
+                float(forward_target_position[1]),
+                float(forward_target_position[2]),
+                float(roll),
+                float(pitch),
+                float(yaw),
+            )
+        else:
+            self._grasp_right_side_mode = False
+            self._grasp_contact_axis = x_axis.copy()
+            self._grasp_pregrasp_distance_m = pregrasp_distance_m
+            self._grasp_target, self._grasp_contact_target, pregrasp_position, forward_target_position = (
+                self._make_grasp_targets(grasp_position, x_axis, rotation, final_gap_m)
+            )
+        # 左右手主抓取计算相同；右手额外沿末端局部 -Y 向右平移，
+        # 用于让夹爪中心而不是手掌中心对准物体。
+        if abs(float(side_offset_m)) > 1e-9 and not right_side_mode:
+            side_offset_m = float(side_offset_m)
+            grasp_pose = (
+                float(grasp_position[0]),
+                float(grasp_position[1]),
+                float(grasp_position[2]),
+                float(roll),
+                float(pitch),
+                float(yaw),
+            )
+            grasp_pose = self._offset_pose_local(grasp_pose, 0.0, side_offset_m, 0.0)
+            self._grasp_target = self._offset_pose_local(self._grasp_target, 0.0, side_offset_m, 0.0)
+            self._grasp_contact_target = self._offset_pose_local(self._grasp_contact_target, 0.0, side_offset_m, 0.0)
+            grasp_position = np.array(grasp_pose[:3], dtype=np.float64)
+            pregrasp_position = np.array(self._grasp_target[:3], dtype=np.float64)
+            forward_target_position = np.array(self._grasp_contact_target[:3], dtype=np.float64)
+            self._grasp_position = grasp_position.copy()
+        side_offset_text = (
+            f"右手 TCP 本地 -Y 偏移: {side_offset_m * 100:+.1f} cm\n"
+            if abs(float(side_offset_m)) > 1e-9 and not right_side_mode
+            else ""
+        )
+        mode_text = (
+            f"抓取模式: {self._grasp_target_arm or 'unknown'} 右手侧向逻辑\n"
+            if right_side_mode
+            else f"抓取模式: {self._grasp_target_arm or 'unknown'} 通用逻辑\n"
+        )
+        axis_text = "TCP +Y: 右手侧向前进方向\n" if right_side_mode else ""
+        sequence_text = (
+            f"操作顺序: 先到物体右侧外 {pregrasp_distance_m * 100:.0f} cm -> 再沿 TCP +Y 前进到距目标约 {final_gap_m * 100:.0f} cm"
+            if right_side_mode
+            else f"操作顺序: 先到目标前 {pregrasp_distance_m * 100:.0f} cm -> "
+            f"再向前 {pregrasp_distance_m * 100 - final_gap_m * 100:.0f} cm，"
+            f"最终距目标约 {final_gap_m * 100:.0f} cm"
         )
         self.grasp_result_label.setText(
             f"目标: {target['class_name']}  置信度: {target['confidence']:.2f}\n"
@@ -2007,14 +2253,22 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             f"{pregrasp_position[0]:+.4f} {pregrasp_position[1]:+.4f} {pregrasp_position[2]:+.4f} m\n"
             f"向前 {final_gap_m * 100:.0f} cm 后的位置 car_link XYZ: "
             f"{forward_target_position[0]:+.4f} {forward_target_position[1]:+.4f} {forward_target_position[2]:+.4f} m\n"
+            f"识别位置 car_link XYZ: {grasp_position[0]:+.4f} {grasp_position[1]:+.4f} {grasp_position[2]:+.4f} m\n"
+            f"预抓取距离: {float(self.grasp_forward_spin.value()) * 100:.1f} cm | 最终距离: {final_gap_m * 100:.1f} cm\n"
+            f"{side_offset_text}"
             f"预抓取姿态 RPY: "
             f"{math.degrees(roll):+.2f} {math.degrees(pitch):+.2f} {math.degrees(yaw):+.2f} deg\n"
             f"TCP +X: {x_axis[0]:+.3f} {x_axis[1]:+.3f} {x_axis[2]:+.3f}\n"
-            f"抓取模式: {self._grasp_target_arm or 'unknown'} 通用逻辑\n"
+            f"{axis_text}"
+            f"{mode_text}"
             f"状态: 已生成，尚未移动\n"
-            f"操作顺序: 先到目标前 {self.grasp_forward_spin.value() * 100:.0f} cm -> "
-            f"再向前 {self.grasp_forward_spin.value() * 100 - final_gap_m * 100:.0f} cm，"
-            f"最终距目标约 {final_gap_m * 100:.0f} cm"
+            f"{sequence_text}"
+        )
+        self.append_log(
+            f"[GRASP] {target['class_name']} 识别位置={grasp_position[0]:+.4f},{grasp_position[1]:+.4f},{grasp_position[2]:+.4f} "
+            f"预抓取位置={pregrasp_position[0]:+.4f},{pregrasp_position[1]:+.4f},{pregrasp_position[2]:+.4f} "
+            f"最终位置={forward_target_position[0]:+.4f},{forward_target_position[1]:+.4f},{forward_target_position[2]:+.4f} "
+            f"预抓取距离={float(self.grasp_forward_spin.value()) * 100:.1f}cm 最终距离={final_gap_m * 100:.1f}cm"
         )
         self.append_log(
             f"[GRASP] 已生成 {target['class_name']} {self._grasp_target_arm or 'unknown'} 通用预抓取姿态"
@@ -2024,54 +2278,42 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self,
         target: dict[str, Any],
         points_car: "np.ndarray",
-        current_tcp: "np.ndarray",
-        class_name: str,
         arm: str,
     ) -> None:
-        """通用侧抓逻辑：右手从物体右侧推进，左手做镜像处理。"""
+        """右手沿 car_link +Y 从物体右侧推进，数据处理方式与左手共用。"""
         import numpy as np
 
-        # car_link 约定 +Y 为左；右手取右侧，左手取左侧。
-        # 使用分位数而不是单个极值，降低深度离群点对抓取点的影响。
-        if arm == "left":
-            y_side = float(np.percentile(points_car[:, 1], 95))
-            approach_axis = np.array([0.0, -1.0, 0.0], dtype=np.float64)
-            side_label = "左侧"
-        else:
-            y_side = float(np.percentile(points_car[:, 1], 5))
-            approach_axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-            side_label = "右侧"
-        x_center = float(np.median(points_car[:, 0]))
-        z_min = float(np.percentile(points_car[:, 2], 5))
-        z_max = float(np.percentile(points_car[:, 2], 95))
-        thickness = z_max - z_min
-        if thickness < 0.02:
-            raise ValueError(f"{class_name} 高度范围异常: {thickness:.3f} m")
+        if arm != "right":
+            raise ValueError("侧向抓取当前只支持右手")
 
-        # 使用物体侧面中部作为参考点，从该侧外沿水平推进。
-        grasp_position = np.array(
-            [x_center, y_side, z_min + thickness * 0.50],
-            dtype=np.float64,
-        )
+        # 右手预抓取点固定在识别目标点的 car_link -Y 方向 10 cm。
+        approach_axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        side_label = "右侧"
+        grasp_position = np.median(points_car, axis=0).astype(np.float64)
 
-        # 右手姿态固定：+X 向前，+Y 向左，+Z 向上；左手做镜像。
-        x_axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-        y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float64) if arm == "right" else np.array([0.0, -1.0, 0.0], dtype=np.float64)
-        z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        rotation = np.column_stack((x_axis, y_axis, z_axis))
+        # 固定为 car_link 轴向：+Y 是右手向物体推进方向，+Z 保持竖直。
+        rotation = np.eye(3, dtype=np.float64)
+        x_axis = rotation[:, 0]
 
         roll, pitch, yaw = rotation_matrix_to_rpy(rotation)
         final_gap_m = float(self.grasp_contact_gap_spin.value()) / 100.0
-        right_pregrasp_distance_m = 0.10
-        if final_gap_m <= 0.0 or final_gap_m >= right_pregrasp_distance_m:
-            raise ValueError("右手最终离目标距离必须大于 0 且小于右侧预抓取距离 10 cm")
+        pregrasp_distance_m = RIGHT_HAND_PREGRASP_DISTANCE_M
+        pregrasp_position = grasp_position - approach_axis * pregrasp_distance_m
+        forward_target_position = grasp_position - approach_axis * final_gap_m
+        if final_gap_m <= 0.0 or final_gap_m >= pregrasp_distance_m:
+            raise ValueError(
+                "右手最终离目标距离必须大于 0 且严格小于右侧预抓取距离 "
+                f"(当前最终距离={final_gap_m * 100:.1f} cm, 预抓取距离={pregrasp_distance_m * 100:.1f} cm, "
+                f"识别位置={grasp_position[0]:+.4f},{grasp_position[1]:+.4f},{grasp_position[2]:+.4f} "
+                f"预抓取位置={pregrasp_position[0]:+.4f},{pregrasp_position[1]:+.4f},{pregrasp_position[2]:+.4f} "
+                f"最终位置={forward_target_position[0]:+.4f},{forward_target_position[1]:+.4f},{forward_target_position[2]:+.4f})"
+            )
         self._grasp_position = grasp_position.copy()
-        # 目标点 - approach_axis * 距离 = 物体侧面外；向前移动就是沿 approach_axis 前进。
+        self._grasp_right_side_mode = True
+        self._grasp_contact_axis = approach_axis.copy()
         self._grasp_approach_axis = approach_axis.copy()
         self._grasp_rotation = rotation.copy()
-        self._grasp_pregrasp_distance_m = right_pregrasp_distance_m
-        pregrasp_position = grasp_position - approach_axis * right_pregrasp_distance_m
-        forward_target_position = grasp_position - approach_axis * final_gap_m
+        self._grasp_pregrasp_distance_m = pregrasp_distance_m
         self._grasp_target = (
             float(pregrasp_position[0]),
             float(pregrasp_position[1]),
@@ -2097,10 +2339,18 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             f"{pregrasp_position[0]:+.4f} {pregrasp_position[1]:+.4f} {pregrasp_position[2]:+.4f} m\n"
             f"向前 {final_gap_m * 100:.0f} cm 后的位置 car_link XYZ: "
             f"{forward_target_position[0]:+.4f} {forward_target_position[1]:+.4f} {forward_target_position[2]:+.4f} m\n"
-            f"侧抓姿态 RPY: {math.degrees(roll):+.2f} {math.degrees(pitch):+.2f} {math.degrees(yaw):+.2f} deg\n"
-            f"TCP +X: 向前，+Y: { '向左' if arm == 'right' else '向右' }，+Z: 向上\n"
+            f"识别位置 car_link XYZ: {grasp_position[0]:+.4f} {grasp_position[1]:+.4f} {grasp_position[2]:+.4f} m\n"
+            f"预抓取距离: {pregrasp_distance_m * 100:.1f} cm | 最终距离: {final_gap_m * 100:.1f} cm\n"
+            f"末端姿态: 单位矩阵 | RPY: {math.degrees(roll):+.2f} {math.degrees(pitch):+.2f} {math.degrees(yaw):+.2f} deg\n"
+            f"TCP +X: 向前，+Y: 向左，+Z: 向上\n"
             f"状态: 已生成，尚未移动\n"
-            f"操作顺序: 先到物体侧面外 10 cm -> 再沿侧向前进到距目标约 {final_gap_m * 100:.0f} cm"
+            f"操作顺序: 先到物体右侧外 {pregrasp_distance_m * 100:.0f} cm -> 再沿 car_link +Y 前进到距目标约 {final_gap_m * 100:.0f} cm"
+        )
+        self.append_log(
+            f"[GRASP] {arm} 识别位置={grasp_position[0]:+.4f},{grasp_position[1]:+.4f},{grasp_position[2]:+.4f} "
+            f"预抓取位置={pregrasp_position[0]:+.4f},{pregrasp_position[1]:+.4f},{pregrasp_position[2]:+.4f} "
+            f"最终位置={forward_target_position[0]:+.4f},{forward_target_position[1]:+.4f},{forward_target_position[2]:+.4f} "
+            f"预抓取距离={pregrasp_distance_m * 100:.1f}cm 最终距离={final_gap_m * 100:.1f}cm"
         )
         self.append_log(f"[GRASP] 已生成 {target['class_name']} {arm} 侧抓姿态")
 
@@ -2124,15 +2374,18 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             self.grasp_result_label.setText("请先点击“生成预抓取姿态”")
             return
         try:
-            final_gap_cm = float(self.grasp_contact_gap_spin.value())
             class_name = str((self._vision_target or {}).get("class_name", "")).strip().lower()
             arm = self._grasp_target_arm or self.grasp_arm_combo.currentText()
+            pregrasp_cm = float(self._grasp_pregrasp_distance_m or 0.0) * 100.0
             self._send_grasp_target(
                 self._grasp_target,
-                f"已发送{arm}臂预备抓取点，当前位于 {class_name or '目标'} 正右侧约 10 cm"
+                f"已发送{arm}臂预备抓取点，当前位于 {class_name or '目标'} 外侧约 {pregrasp_cm:.0f} cm"
                 if class_name in RIGHT_HAND_GRASP_LABELS
-                else f"已发送调整姿态目标，当前位于目标外侧约 {final_gap_cm:.0f} cm",
+                else f"已发送调整姿态目标，当前位于目标外侧约 {pregrasp_cm:.0f} cm",
             )
+            if arm == "right" and self._right_dplus_joint_pending:
+                self._right_dplus_joint_pending = False
+                self._apply_right_dplus_joint_pose()
         except Exception as exc:
             self.grasp_result_label.setText(f"调整到抓取位置失败: {exc}")
             self.append_log(f"[GRASP] 调整失败: {exc}")
@@ -2146,6 +2399,21 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         if self._grasp_target is None:
             self.grasp_result_label.setText("请先点击“生成预抓取姿态”")
             return
+        self._right_dplus_joint_pending = self._grasp_target_arm == "right"
+        self._right_dplus_joint_started_at = time.monotonic()
+        self._right_dplus_original_joints = None
+        if self._right_dplus_joint_pending:
+            right_current = self._backend.snapshot().arm_joint_values(RIGHT_ARM_JOINTS)
+            if len(right_current) != 7 or any(value is None for value in right_current):
+                self.grasp_result_label.setText("右手D+预失败：执行前无法读取完整的右臂关节状态")
+                self.append_log("[GRASP] right D+预 failed: original right joint state unavailable")
+                self._right_dplus_joint_pending = False
+                return
+            self._right_dplus_original_joints = tuple(float(value) for value in right_current if value is not None)
+            self.append_log(
+                "[GRASP] right D+预 保存原始关节: "
+                + " ".join(f"{math.degrees(value):+.1f}" for value in self._right_dplus_original_joints)
+            )
         self._start_process(
             [sys.executable, str(ROOT / "scripts/joint_dmp_pipeline.py"), "play", "--model", str(model)],
             "[GRASP] D+预: play guazi DMP",
@@ -2153,8 +2421,46 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             on_success=self._move_to_grasp_align,
         )
 
+    def _apply_right_dplus_joint_pose(self, current: Optional[tuple[float, ...]] = None, target: Optional[tuple[float, ...]] = None) -> None:
+        snap = self._backend.snapshot()
+        right_current = self._right_dplus_original_joints or snap.arm_joint_values(RIGHT_ARM_JOINTS)
+        left_current = snap.arm_joint_values(LEFT_ARM_JOINTS)
+        if len(right_current) != 7 or len(left_current) != 7:
+            raise ValueError("当前关节状态不完整，无法执行右手 D+预后的关节变化")
+        if any(value is None for value in right_current) or any(value is None for value in left_current):
+            raise ValueError("当前关节状态不完整，无法执行右手 D+预后的关节变化")
+        right_values = list(float(value) for value in right_current if value is not None)
+        right_values[3] = math.radians(110.0)
+        right_values[6] = math.radians(-4.7)
+        try:
+            self._backend.send(
+                "arm_joint",
+                left=tuple(float(value) for value in left_current if value is not None),
+                right=tuple(right_values),
+                vel=0.30,
+                acc=0.50,
+            )
+            msg = (
+                "[GRASP] right D+预 joint pose -> rjoint4=+110.0deg rjoint7=-4.7deg 成功"
+                + " final_right=" + " ".join(f"{math.degrees(value):+.1f}" for value in right_values)
+                + (f" target={target[0]:+.4f},{target[1]:+.4f},{target[2]:+.4f}" if target is not None else "")
+                + (f" current={current[0]:+.4f},{current[1]:+.4f},{current[2]:+.4f}" if current is not None else "")
+            )
+            self.append_log(msg)
+            if hasattr(self, "grasp_result_label"):
+                self.grasp_result_label.setText(self.grasp_result_label.text() + "\n状态: 右手已切换到最终关节姿态")
+        except Exception as exc:
+            msg = (
+                f"[GRASP] right D+预 joint pose -> rjoint4=+110.0deg rjoint7=-4.7deg 失败: {exc}"
+                + (f" target={target[0]:+.4f},{target[1]:+.4f},{target[2]:+.4f}" if target is not None else "")
+                + (f" current={current[0]:+.4f},{current[1]:+.4f},{current[2]:+.4f}" if current is not None else "")
+            )
+            self.append_log(msg)
+            if hasattr(self, "grasp_result_label"):
+                self.grasp_result_label.setText(self.grasp_result_label.text() + f"\n状态: 右手关节切换失败: {exc}")
+
     def _move_to_grasp_front(self) -> None:
-        """按当前输入的相对步长前进，不自动执行夹爪闭合。"""
+        """按当前末端局部 +X 方向前进，不自动执行夹爪闭合。"""
         try:
             step_cm = float(self.grasp_contact_gap_spin.value())
             step_m = step_cm / 100.0
@@ -2162,14 +2468,14 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             target = self._build_relative_forward_target(step_m)
             self._send_grasp_target(
                 target,
-                f"已相对前进 {step_cm:.0f} cm，未闭合夹爪",
+                f"已沿当前 TCP +X 前进 {step_cm:.0f} cm，未闭合夹爪",
             )
         except Exception as exc:
             self.grasp_result_label.setText(f"发送预抓取位姿失败: {exc}")
             self.append_log(f"[GRASP] 发送失败: {exc}")
 
     def _build_relative_forward_target(self, step_m: float) -> tuple[float, ...]:
-        """根据当前 TCP 状态生成相对前进目标。"""
+        """根据当前 TCP 状态生成沿局部 +X 的前进目标。"""
         snap = self._backend.snapshot()
         arm = self._grasp_target_arm or self.grasp_arm_combo.currentText()
         if arm == "left":
@@ -2183,7 +2489,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             if pose is None:
                 raise ValueError("右臂当前没有 TCP 状态")
             current = self._pose_xyzrpy(pose, "右臂 TCP")
-            target = self._offset_pose_local(current, 0.0, step_m, 0.0)
+            target = self._offset_pose_local(current, step_m, 0.0, 0.0)
         self._grasp_contact_target = target
         return target
 
@@ -2195,9 +2501,10 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         try:
             class_name = str((self._vision_target or {}).get("class_name", "")).strip().lower()
             arm = self._grasp_target_arm or self.grasp_arm_combo.currentText()
+            pregrasp_cm = float(self._grasp_pregrasp_distance_m or 0.0) * 100.0
             self._send_grasp_target(
                 self._grasp_target,
-                f"已发送{arm}臂后退目标，回到 {class_name or '目标'} 正右侧约 10 cm 的预抓取位姿"
+                f"已发送{arm}臂后退目标，回到 {class_name or '目标'} 外侧约 {pregrasp_cm:.0f} cm 的预抓取位姿"
                 if class_name in RIGHT_HAND_GRASP_LABELS
                 else f"已发送{arm}臂后退目标，回到目标外侧预抓取位姿",
             )
@@ -2547,75 +2854,57 @@ class DmpMainWindow(QtWidgets.QMainWindow):
 
             confs = result.boxes.conf.cpu().numpy()
             classes = result.boxes.cls.cpu().numpy().astype(int)
-            index = int(np.argmax(confs))
-            class_id = int(classes[index])
-            class_name = str(self._yolo_model.names[class_id])
-            mask = result.masks.data[index].cpu().numpy() > 0.5
+            masks = result.masks.data.cpu().numpy() > 0.5
             height, width = color_image.shape[:2]
-            if mask.shape != (height, width):
-                mask = cv2.resize(mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST).astype(bool)
-            kernel = np.ones((5, 5), dtype=np.uint8)
-            inner_mask = cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-            fx, fy, cx, cy, _depth_scale, frame_id = intrinsics
+            if masks.shape[1:] != (height, width):
+                masks = np.stack(
+                    [
+                        cv2.resize(mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST).astype(bool)
+                        for mask in masks
+                    ],
+                    axis=0,
+                )
+
+            detections = []
+            for index in range(len(result.boxes)):
+                det = self._build_segmentation_detection(
+                    index,
+                    int(classes[index]),
+                    str(self._yolo_model.names[int(classes[index])]),
+                    float(confs[index]),
+                    masks[index],
+                    color_image,
+                    depth_m,
+                    intrinsics,
+                    cv2,
+                    np,
+                )
+                if det is not None:
+                    detections.append(det)
+
+            if not detections:
+                raise RuntimeError("目标 mask 内有效深度点太少")
+
+            detections.sort(key=lambda item: (-item["pixel"][1], item["median_depth"], -item["confidence"]))
+            selected = detections[0]
+            mask = masks[int(selected["index"])]
             valid = (
-                inner_mask
+                mask
                 & np.isfinite(depth_m)
                 & (depth_m > 0.10)
                 & (depth_m < 2.00)
             )
-            if int(np.count_nonzero(valid)) < 20:
-                raise RuntimeError("目标 mask 内有效深度点太少")
-            median_depth = float(np.median(depth_m[valid]))
-            valid &= np.abs(depth_m - median_depth) < 0.05
-            v_idx, u_idx = np.nonzero(valid)
-            z = depth_m[v_idx, u_idx].astype(np.float64)
-            points = np.column_stack(
-                (
-                    (u_idx.astype(np.float64) - cx) * z / fx,
-                    (v_idx.astype(np.float64) - cy) * z / fy,
-                    z,
-                )
-            )
-            if len(points) == 0:
-                raise RuntimeError("深度过滤后没有三维点")
-            center = np.median(points, axis=0)
-            base_center = None
-            car_link_center = None
-            points_base = None
-            points_car = None
-            if self._camera_to_base is not None:
-                # 第一步：相机坐标系 -> body_link。
-                camera_points_h = np.column_stack(
-                    (points, np.ones((len(points), 1), dtype=np.float64))
-                )
-                points_base = (
-                    np.asarray(self._camera_to_base, dtype=np.float64)
-                    @ camera_points_h.T
-                ).T[:, :3]
-                base_center = tuple(np.median(points_base, axis=0).tolist())
-                snap = self._backend.snapshot()
-                # 第二步：body_link -> car_link。
-                # 抓取页和笛卡尔控制统一使用 car_link。
-                if snap.car_from_body is not None:
-                    points_base_h = np.column_stack(
-                        (points_base, np.ones((len(points_base), 1), dtype=np.float64))
-                    )
-                    points_car = (
-                        np.asarray(snap.car_from_body, dtype=np.float64)
-                        @ points_base_h.T
-                    ).T[:, :3]
-                    car_link_center = tuple(np.median(points_car, axis=0).tolist())
 
             # 缓存最近一次视觉结果，供“瓶子抓取”页使用。
             # 不直接在视觉页执行运动，避免采集数据时误触发机械臂。
             self._vision_target = {
-                "class_name": class_name,
-                "confidence": float(confs[index]),
-                "center_camera": np.asarray(center, dtype=np.float64),
-                "points_camera": np.asarray(points, dtype=np.float64),
-                "points_base": points_base,
-                "points_car": points_car,
-                "frame_id": frame_id,
+                "class_name": selected["class_name"],
+                "confidence": float(selected["confidence"]),
+                "center_camera": np.asarray(selected["center_camera"], dtype=np.float64),
+                "points_camera": np.asarray(selected["points_camera"], dtype=np.float64),
+                "points_base": selected["points_base"],
+                "points_car": selected["points_car"],
+                "frame_id": intrinsics[5],
             }
 
             overlay = color_image.copy()
@@ -2625,29 +2914,31 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             overlay[valid] = (
                 0.25 * overlay[valid] + 0.75 * np.array([0, 0, 255], dtype=np.float32)
             ).astype(np.uint8)
-            cv2.circle(overlay, (int(np.median(u_idx)), int(np.median(v_idx))), 6, (255, 255, 255), -1)
+            px, py = selected["pixel"]
+            cv2.circle(overlay, (px, py), 6, (255, 255, 255), -1)
             self._set_camera_pixmap(self.camera_color_label, overlay, QtGui.QImage.Format_BGR888)
             self._set_camera_pixmap(self.vision_result_image, overlay, QtGui.QImage.Format_BGR888)
 
             base_text = (
-                f"base/body_link XYZ: {base_center[0]:+.4f} {base_center[1]:+.4f} {base_center[2]:+.4f} m\n"
-                if base_center is not None
+                f"base/body_link XYZ: {np.mean(selected['points_base'], axis=0)[0]:+.4f} {np.mean(selected['points_base'], axis=0)[1]:+.4f} {np.mean(selected['points_base'], axis=0)[2]:+.4f} m\n"
+                if selected["points_base"] is not None
                 else ""
             )
             car_link_text = (
-                f"car_link XYZ: {car_link_center[0]:+.4f} {car_link_center[1]:+.4f} {car_link_center[2]:+.4f} m\n"
-                if car_link_center is not None
+                f"car_link XYZ: {np.mean(selected['points_car'], axis=0)[0]:+.4f} {np.mean(selected['points_car'], axis=0)[1]:+.4f} {np.mean(selected['points_car'], axis=0)[2]:+.4f} m\n"
+                if selected["points_car"] is not None
                 else ""
             )
             text = (
-                f"标签: {class_name}\n"
-                f"置信度: {float(confs[index]):.2f}\n"
-                f"坐标系: {frame_id}\n"
-                f"相机坐标 XYZ: {center[0]:+.4f} {center[1]:+.4f} {center[2]:+.4f} m\n"
+                f"标签: {selected['class_name']}\n"
+                f"置信度: {selected['confidence']:.2f}\n"
+                f"坐标系: {intrinsics[5]}\n"
+                f"相机坐标 XYZ: {selected['center_camera'][0]:+.4f} {selected['center_camera'][1]:+.4f} {selected['center_camera'][2]:+.4f} m\n"
                 f"{base_text}"
                 f"{car_link_text}"
-                f"有效深度点: {len(points)}\n"
-                f"主深度中位数: {median_depth:+.4f} m"
+                f"有效深度点: {len(selected['points_camera'])}\n"
+                f"主深度中位数: {selected['median_depth']:+.4f} m\n"
+                f"抓取结果: 已选前排目标"
             )
             self.vision_result_label.setText(text)
             self.append_log("[VISION]\n" + text)
@@ -2994,6 +3285,84 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             raise ValueError("需要 x y z 三个值，单位 cm")
         return tuple(float(value) / 100.0 for value in parts)
 
+    def _build_segmentation_detection(
+        self,
+        index: int,
+        class_id: int,
+        class_name: str,
+        conf: float,
+        mask: "np.ndarray",
+        color_image: "np.ndarray",
+        depth_m: "np.ndarray",
+        intrinsics: tuple[float, float, float, float, float, str],
+        cv2: Any,
+        np: Any,
+    ) -> Optional[dict[str, Any]]:
+        height, width = color_image.shape[:2]
+        if mask.shape != (height, width):
+            mask = cv2.resize(mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST).astype(bool)
+        kernel = np.ones((5, 5), dtype=np.uint8)
+        inner_mask = cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+        fx, fy, cx, cy, _depth_scale, frame_id = intrinsics
+        valid = (
+            inner_mask
+            & np.isfinite(depth_m)
+            & (depth_m > 0.10)
+            & (depth_m < 2.00)
+        )
+        if int(np.count_nonzero(valid)) < 20:
+            return None
+        median_depth = float(np.median(depth_m[valid]))
+        valid &= np.abs(depth_m - median_depth) < 0.05
+        v_idx, u_idx = np.nonzero(valid)
+        z = depth_m[v_idx, u_idx].astype(np.float64)
+        points = np.column_stack(
+            (
+                (u_idx.astype(np.float64) - cx) * z / fx,
+                (v_idx.astype(np.float64) - cy) * z / fy,
+                z,
+            )
+        )
+        if len(points) == 0:
+            return None
+        center = np.median(points, axis=0)
+        base_center = None
+        car_link_center = None
+        points_base = None
+        points_car = None
+        if self._camera_to_base is not None:
+            camera_points_h = np.column_stack(
+                (points, np.ones((len(points), 1), dtype=np.float64))
+            )
+            points_base = (
+                np.asarray(self._camera_to_base, dtype=np.float64)
+                @ camera_points_h.T
+            ).T[:, :3]
+            base_center = tuple(np.median(points_base, axis=0).tolist())
+            snap = self._backend.snapshot()
+            if snap.car_from_body is not None:
+                points_base_h = np.column_stack(
+                    (points_base, np.ones((len(points_base), 1), dtype=np.float64))
+                )
+                points_car = (
+                    np.asarray(snap.car_from_body, dtype=np.float64)
+                    @ points_base_h.T
+                ).T[:, :3]
+                car_link_center = tuple(np.median(points_car, axis=0).tolist())
+        grasp_source = car_link_center or base_center or tuple(center.tolist())
+        return {
+            "index": index,
+            "confidence": float(conf),
+            "class_name": class_name,
+            "pixel": (int(np.median(u_idx)), int(np.median(v_idx))),
+            "grasp_point": tuple(float(v) for v in grasp_source),
+            "center_camera": tuple(float(v) for v in center.tolist()),
+            "points_camera": points,
+            "points_base": points_base,
+            "points_car": points_car,
+            "median_depth": median_depth,
+        }
+
     def _update_lift_preview(self, snap: Optional[RobotSnapshot] = None) -> None:
         current_snap = self._backend.snapshot() if snap is None else snap
         pose = current_snap.leg_pose()
@@ -3084,8 +3453,29 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self.append_log("[CMD] second layer height -> 0 0 0 0")
 
     def _send_reset_arms(self) -> None:
-        self._backend.send("arm_joint", left=tuple(math.radians(v) for v in RESET_LEFT_ARM_DEG), right=tuple(math.radians(v) for v in RESET_RIGHT_ARM_DEG), vel=0.30, acc=0.50)
-        self.append_log("[CMD] reset arms only; leg/waist unchanged")
+        snap = self._backend.snapshot()
+        leg_current = snap.arm_joint_values(LEG_JOINTS)
+        if len(leg_current) != 4 or any(value is None for value in leg_current):
+            raise ValueError("当前腰腿状态还没读全，无法复位机械臂")
+        self._backend.send(
+            "arm_joint",
+            left=tuple(math.radians(v) for v in RESET_LEFT_ARM_DEG),
+            right=tuple(math.radians(v) for v in RESET_RIGHT_ARM_DEG),
+            vel=0.30,
+            acc=0.50,
+        )
+        self._backend.send(
+            "leg_joint",
+            values=(
+                float(leg_current[0]),
+                float(leg_current[1]),
+                float(leg_current[2]),
+                0.0,
+            ),
+            vel=0.08,
+            acc=0.20,
+        )
+        self.append_log("[CMD] reset arms; keep leg joints and zero hip_yaw_joint")
 
     def _send_reset(self) -> None:
         self._send_reset_arms()
@@ -3147,6 +3537,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         event.accept()
 
     def shutdown(self) -> None:
+        self._backend.send("base_cmd", linear_x=0.0, angular_z=0.0)
         self._recording_active = False
         self._cart_recording_active = False
         self._stop_final_grasp_process()
