@@ -18,7 +18,7 @@ BOX_WIDTH_M = 0.35
 BOX_HEIGHT_M = 0.17
 BOX_CLASS_ALIASES = {"box", "xiangzi", "carton", "crate", "boxy"}
 BOX_READY_LEFT_ARM_DEG = (15.8, 22.5, -19.3, -100.4, -22.7, -12.4, 6.9)
-BOX_READY_RIGHT_ARM_DEG = (-18.8, -14.7, 16.0, 100.4, 23.9, 16.0, -4.0)
+BOX_READY_RIGHT_ARM_DEG = (-15.7, -14.6, 16.0, 103.1, 16.0, 15.0, -1.7)
 
 
 def _normalize(vec: np.ndarray) -> np.ndarray:
@@ -278,53 +278,57 @@ def generate_side_grasp_candidates(
     face_span_m: float = max(BOX_LENGTH_M, BOX_WIDTH_M),
     box_depth_m: float = min(BOX_LENGTH_M, BOX_WIDTH_M),
     pregrasp_dist_m: float = 0.08,
-    side_clearance_m: float = 0.035,
     grasp_z_offset_m: float = 0.0,
     grasp_x_offset_m: float = 0.0,
+    front_center_base: np.ndarray | None = None,
+    box_center_base: np.ndarray | None = None,
 ) -> dict[str, dict[str, np.ndarray]]:
     T_base_box = np.asarray(T_base_box, dtype=np.float64).reshape(4, 4)
     R = T_base_box[:3, :3]
     center = T_base_box[:3, 3]
     x_box, y_box, z_box = R[:, 0], R[:, 1], R[:, 2]
-    grasp_x = float(grasp_x_offset_m)
-    grasp_z = float(grasp_z_offset_m)
     face_span_m = float(face_span_m)
-    box_depth_m = float(box_depth_m)
-    left_grasp_box = np.array([grasp_x, -(0.5 * face_span_m + side_clearance_m), grasp_z], dtype=np.float64)
-    right_grasp_box = np.array([grasp_x, +(0.5 * face_span_m + side_clearance_m), grasp_z], dtype=np.float64)
-    left_pre_box = left_grasp_box + np.array([0.0, -float(pregrasp_dist_m), 0.0], dtype=np.float64)
-    right_pre_box = right_grasp_box + np.array([0.0, +float(pregrasp_dist_m), 0.0], dtype=np.float64)
+    if front_center_base is not None and box_center_base is not None:
+        front_center_base = np.asarray(front_center_base, dtype=np.float64).reshape(3)
+        box_center_base = np.asarray(box_center_base, dtype=np.float64).reshape(3)
+        grasp_x = float(front_center_base[0])
+        grasp_z = float(box_center_base[2] + grasp_z_offset_m)
+        grasp_y_offset = 0.5 * face_span_m
+        left_grasp_base = np.array([grasp_x, box_center_base[1] + grasp_y_offset, grasp_z], dtype=np.float64)
+        right_grasp_base = np.array([grasp_x, box_center_base[1] - grasp_y_offset, grasp_z], dtype=np.float64)
+        left_pre_base = left_grasp_base + np.array([0.0, +float(pregrasp_dist_m), 0.0], dtype=np.float64)
+        right_pre_base = right_grasp_base + np.array([0.0, -float(pregrasp_dist_m), 0.0], dtype=np.float64)
+        use_direct_base = True
+    else:
+        grasp_x = float(grasp_x_offset_m)
+        grasp_z = float(grasp_z_offset_m)
+        box_depth_m = float(box_depth_m)
+        left_grasp_box = np.array([grasp_x, +0.5 * face_span_m, grasp_z], dtype=np.float64)
+        right_grasp_box = np.array([grasp_x, -0.5 * face_span_m, grasp_z], dtype=np.float64)
+        left_pre_box = left_grasp_box + np.array([0.0, +float(pregrasp_dist_m), 0.0], dtype=np.float64)
+        right_pre_box = right_grasp_box + np.array([0.0, -float(pregrasp_dist_m), 0.0], dtype=np.float64)
+        use_direct_base = False
 
     def to_base(point_box: np.ndarray) -> np.ndarray:
         return center + point_box[0] * x_box + point_box[1] * y_box + point_box[2] * z_box
 
-    def make_rotation(approach_axis_base: np.ndarray) -> np.ndarray:
-        x_axis = _normalize(np.asarray(approach_axis_base, dtype=np.float64).reshape(3))
-        z_axis = _normalize(z_box)
-        y_axis = np.cross(z_axis, x_axis)
-        if float(np.linalg.norm(y_axis)) < 1e-9:
-            y_axis = np.cross(np.array([1.0, 0.0, 0.0], dtype=np.float64), x_axis)
-        y_axis = _normalize(y_axis)
-        z_axis = _normalize(np.cross(x_axis, y_axis))
-        return np.column_stack((x_axis, y_axis, z_axis))
-
     candidates = {
         "left": {
-            "grasp_box": left_grasp_box,
-            "pregrasp_box": left_pre_box,
-            "approach_box": np.array([0.0, +1.0, 0.0], dtype=np.float64),
+            "grasp_box": left_grasp_base if use_direct_base else left_grasp_box,
+            "pregrasp_box": left_pre_base if use_direct_base else left_pre_box,
+            "approach_box": np.array([0.0, -1.0, 0.0], dtype=np.float64),
         },
         "right": {
-            "grasp_box": right_grasp_box,
-            "pregrasp_box": right_pre_box,
-            "approach_box": np.array([0.0, -1.0, 0.0], dtype=np.float64),
+            "grasp_box": right_grasp_base if use_direct_base else right_grasp_box,
+            "pregrasp_box": right_pre_base if use_direct_base else right_pre_box,
+            "approach_box": np.array([0.0, +1.0, 0.0], dtype=np.float64),
         },
     }
     for side, item in candidates.items():
-        grasp_base = to_base(item["grasp_box"])
-        pregrasp_base = to_base(item["pregrasp_box"])
+        grasp_base = item["grasp_box"] if use_direct_base else to_base(item["grasp_box"])
+        pregrasp_base = item["pregrasp_box"] if use_direct_base else to_base(item["pregrasp_box"])
         approach_base = _normalize(R @ item["approach_box"])
-        rotation = make_rotation(approach_base)
+        rotation = R.copy()
         item.update(
             {
                 "grasp_base": grasp_base,
@@ -421,13 +425,6 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         self.pregrasp_spin.setValue(0.08)
         self.pregrasp_spin.setSuffix(" m")
 
-        self.side_clearance_spin = QtWidgets.QDoubleSpinBox()
-        self.side_clearance_spin.setRange(0.00, 0.12)
-        self.side_clearance_spin.setDecimals(3)
-        self.side_clearance_spin.setSingleStep(0.005)
-        self.side_clearance_spin.setValue(0.035)
-        self.side_clearance_spin.setSuffix(" m")
-
         self.grasp_z_spin = QtWidgets.QDoubleSpinBox()
         self.grasp_z_spin.setRange(-0.12, 0.12)
         self.grasp_z_spin.setDecimals(3)
@@ -447,26 +444,42 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         self.max_plot_points_spin.setSingleStep(500)
         self.max_plot_points_spin.setValue(3500)
 
-        self.generate_btn = QtWidgets.QPushButton("生成箱体位姿")
+        self.generate_btn = QtWidgets.QPushButton("生成预抓取点")
         self.refresh_btn = QtWidgets.QPushButton("刷新视图")
         self.ready_pose_btn = QtWidgets.QPushButton("箱子初始姿态")
+        self.left_pregrasp_btn = QtWidgets.QPushButton("左手预抓取")
+        self.left_forward_btn = QtWidgets.QPushButton("左手前进")
+        self.right_pregrasp_btn = QtWidgets.QPushButton("右手预抓取")
+        self.right_forward_btn = QtWidgets.QPushButton("右手前进")
+        self.both_pregrasp_btn = QtWidgets.QPushButton("双手预抓取")
+        self.both_forward_btn = QtWidgets.QPushButton("双手前进")
         self.generate_btn.clicked.connect(self.generate)
         self.refresh_btn.clicked.connect(self.refresh_view)
         self.ready_pose_btn.clicked.connect(self.send_box_ready_pose)
+        self.left_pregrasp_btn.clicked.connect(lambda: self.send_box_arm_target("left", "pregrasp"))
+        self.left_forward_btn.clicked.connect(lambda: self.send_box_arm_target("left", "grasp"))
+        self.right_pregrasp_btn.clicked.connect(lambda: self.send_box_arm_target("right", "pregrasp"))
+        self.right_forward_btn.clicked.connect(lambda: self.send_box_arm_target("right", "grasp"))
+        self.both_pregrasp_btn.clicked.connect(lambda: self.send_box_both_targets("pregrasp"))
+        self.both_forward_btn.clicked.connect(lambda: self.send_box_both_targets("grasp"))
 
         controls.addWidget(QtWidgets.QLabel("预抓取距离"), 0, 0)
         controls.addWidget(self.pregrasp_spin, 0, 1)
-        controls.addWidget(QtWidgets.QLabel("侧向外扩"), 0, 2)
-        controls.addWidget(self.side_clearance_spin, 0, 3)
-        controls.addWidget(QtWidgets.QLabel("抓取高度偏移"), 1, 0)
-        controls.addWidget(self.grasp_z_spin, 1, 1)
-        controls.addWidget(QtWidgets.QLabel("平面阈值"), 1, 2)
-        controls.addWidget(self.front_threshold_spin, 1, 3)
-        controls.addWidget(QtWidgets.QLabel("点云采样上限"), 2, 0)
-        controls.addWidget(self.max_plot_points_spin, 2, 1)
-        controls.addWidget(self.generate_btn, 2, 2)
-        controls.addWidget(self.refresh_btn, 2, 3)
-        controls.addWidget(self.ready_pose_btn, 2, 4)
+        controls.addWidget(QtWidgets.QLabel("抓取高度偏移"), 0, 2)
+        controls.addWidget(self.grasp_z_spin, 0, 3)
+        controls.addWidget(QtWidgets.QLabel("平面阈值"), 1, 0)
+        controls.addWidget(self.front_threshold_spin, 1, 1)
+        controls.addWidget(QtWidgets.QLabel("点云采样上限"), 1, 2)
+        controls.addWidget(self.max_plot_points_spin, 1, 3)
+        controls.addWidget(self.generate_btn, 2, 0)
+        controls.addWidget(self.refresh_btn, 2, 1)
+        controls.addWidget(self.ready_pose_btn, 2, 2)
+        controls.addWidget(self.left_pregrasp_btn, 3, 0)
+        controls.addWidget(self.left_forward_btn, 3, 1)
+        controls.addWidget(self.right_pregrasp_btn, 3, 2)
+        controls.addWidget(self.right_forward_btn, 3, 3)
+        controls.addWidget(self.both_pregrasp_btn, 4, 0, 1, 2)
+        controls.addWidget(self.both_forward_btn, 4, 2, 1, 2)
         layout.addWidget(control_box)
 
         self.result_label = QtWidgets.QLabel("请先在 YOLO 页识别 box / xiangzi")
@@ -514,6 +527,41 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         if T_base_camera is None:
             raise ValueError("没有相机外参，无法把点云转到 base_link")
         return transform_points(np.asarray(points_camera, dtype=np.float64), np.asarray(T_base_camera, dtype=np.float64))
+
+    def _extract_car_link_geometry(self, target: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        snap = self._host._backend.snapshot()
+        if snap.car_from_body is None:
+            raise ValueError("car_link <- body_link TF 未就绪，无法生成 car_link 下的箱体位姿")
+        T_car_body = np.asarray(snap.car_from_body, dtype=np.float64).reshape(4, 4)
+
+        points_body = target.get("points_car")
+        if points_body is not None:
+            points_car = _ensure_points_array(points_body)
+        else:
+            points_base = target.get("points_base")
+            if points_base is not None:
+                points_body = _ensure_points_array(points_base)
+            else:
+                points_camera = target.get("points_camera")
+                if points_camera is None:
+                    raise ValueError("YOLO 结果里没有可用的点云")
+                T_body_camera = getattr(self._host, "_camera_to_base", None)
+                if T_body_camera is None:
+                    raise ValueError("没有相机外参，无法把点云转到 body_link")
+                points_body = transform_points(
+                    np.asarray(points_camera, dtype=np.float64),
+                    np.asarray(T_body_camera, dtype=np.float64),
+                )
+            points_body_h = np.column_stack((points_body, np.ones((len(points_body), 1), dtype=np.float64)))
+            points_car = (T_car_body @ points_body_h.T).T[:, :3]
+
+        T_body_camera = getattr(self._host, "_camera_to_base", None)
+        if T_body_camera is None:
+            raise ValueError("没有相机外参，无法确定 car_link 下相机位置")
+        T_body_camera = np.asarray(T_body_camera, dtype=np.float64).reshape(4, 4)
+        camera_pos_body = T_body_camera[:3, 3]
+        camera_pos_car = (T_car_body @ np.array([camera_pos_body[0], camera_pos_body[1], camera_pos_body[2], 1.0], dtype=np.float64))[:3]
+        return points_car, camera_pos_car
 
     def _plot_solution(self, points_base: np.ndarray, solution: BoxBimanualGraspSolution) -> None:
         self.figure.clear()
@@ -631,6 +679,63 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
             f"{math.degrees(pose[3]):+.2f} {math.degrees(pose[4]):+.2f} {math.degrees(pose[5]):+.2f}"
         )
 
+    def _require_solution(self) -> BoxBimanualGraspSolution:
+        if self._solution is None:
+            raise ValueError("请先生成箱体位姿")
+        return self._solution
+
+    def _current_arm_targets(self) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        snap = self._host._backend.snapshot()
+        left = tuple(self._host._pose_xyzrpy(snap.left_ee, "左臂 TCP"))
+        right = tuple(self._host._pose_xyzrpy(snap.right_ee, "右臂 TCP"))
+        return left, right
+
+    def _solution_pose_for_arm(self, arm: str, stage: str) -> tuple[float, ...]:
+        solution = self._require_solution()
+        if arm not in solution.candidates:
+            raise ValueError(f"{arm} 臂没有可用的预抓取点")
+        key = "pose_pregrasp_base" if stage == "pregrasp" else "pose_grasp_base"
+        pose = solution.candidates[arm][key]
+        return tuple(float(value) for value in pose.tolist())
+
+    def send_box_arm_target(self, arm: str, stage: str) -> None:
+        try:
+            left, right = self._current_arm_targets()
+            target = self._solution_pose_for_arm(arm, stage)
+            if arm == "left":
+                left = target
+                label = "左手"
+            elif arm == "right":
+                right = target
+                label = "右手"
+            else:
+                raise ValueError(f"unknown arm: {arm}")
+            self._host._backend.send("arm_cartesian", left=left, right=right, vel=0.05, acc=0.10)
+            action = "预抓取" if stage == "pregrasp" else "前进"
+            text = f"{label}{action}目标已发送: {self._format_pose(np.asarray(target, dtype=np.float64))}"
+            self.result_label.setText(text)
+            self._append_log("[BOX] " + text)
+        except Exception as exc:
+            self.result_label.setText(f"发送失败: {exc}")
+            self._append_log(f"[BOX] 发送失败: {exc}")
+
+    def send_box_both_targets(self, stage: str) -> None:
+        try:
+            left = self._solution_pose_for_arm("left", stage)
+            right = self._solution_pose_for_arm("right", stage)
+            self._host._backend.send("arm_cartesian", left=left, right=right, vel=0.05, acc=0.10)
+            action = "预抓取" if stage == "pregrasp" else "前进"
+            text = (
+                f"双手{action}目标已发送 | "
+                f"左 {self._format_pose(np.asarray(left, dtype=np.float64))} | "
+                f"右 {self._format_pose(np.asarray(right, dtype=np.float64))}"
+            )
+            self.result_label.setText(text)
+            self._append_log("[BOX] " + text)
+        except Exception as exc:
+            self.result_label.setText(f"双手发送失败: {exc}")
+            self._append_log(f"[BOX] 双手发送失败: {exc}")
+
     def send_box_ready_pose(self) -> None:
         try:
             left = tuple(math.radians(value) for value in BOX_READY_LEFT_ARM_DEG)
@@ -650,22 +755,15 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
     def generate(self) -> None:
         try:
             target = self._current_target()
-            points_base = self._extract_points_base(target)
-            self._last_points_base = points_base
-            frame_id = str(target.get("frame_id", "base_link"))
+            points_car, camera_pos_car = self._extract_car_link_geometry(target)
+            self._last_points_base = points_car
+            frame_id = "car_link"
             class_name = str(target.get("class_name", "")).strip().lower()
             confidence = float(target.get("confidence", 0.0))
-            self._append_log(
-                f"[BOX] 读取 YOLO 结果: class={class_name or '--'} conf={confidence:.2f} frame={frame_id}"
-            )
-
-            camera_to_base = getattr(self._host, "_camera_to_base", None)
-            if camera_to_base is None:
-                raise ValueError("缺少 camera_to_base 外参")
-            camera_pos_base = np.asarray(camera_to_base, dtype=np.float64).reshape(4, 4)[:3, 3]
+            self._append_log(f"[BOX] 读取 YOLO 结果: class={class_name or '--'} conf={confidence:.2f} frame={frame_id}")
 
             front_points, front_normal, plane_debug = estimate_front_plane(
-                points_base,
+                points_car,
                 preferred_face_span_m=BOX_LENGTH_M,
                 preferred_height_m=BOX_HEIGHT_M,
                 distance_threshold=float(self.front_threshold_spin.value()),
@@ -673,7 +771,7 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
             T_base_box, box_debug = estimate_box_frame(
                 front_points,
                 front_normal,
-                camera_pos_base,
+                camera_pos_car,
                 box_length_m=BOX_LENGTH_M,
                 box_width_m=BOX_WIDTH_M,
                 box_height_m=BOX_HEIGHT_M,
@@ -683,8 +781,10 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
                 face_span_m=float(box_debug["face_span_m"]),
                 box_depth_m=float(box_debug["box_depth_m"]),
                 pregrasp_dist_m=float(self.pregrasp_spin.value()),
-                side_clearance_m=float(self.side_clearance_spin.value()),
                 grasp_z_offset_m=float(self.grasp_z_spin.value()),
+                grasp_x_offset_m=-0.5 * float(box_debug["box_depth_m"]),
+                front_center_base=box_debug["front_center_base"],
+                box_center_base=box_debug["box_center_base"],
             )
             snap = self._host._backend.snapshot() if hasattr(self._host, "_backend") else None
             left_tcp = None
@@ -703,8 +803,9 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
                 debug_info={
                     "plane": plane_debug,
                     "box": box_debug,
-                    "input_point_count": int(len(points_base)),
+                    "input_point_count": int(len(points_car)),
                     "assigned_policy": assignment["policy"],
+                    "task_frame": frame_id,
                 },
                 candidates=candidates,
                 assignment=assignment,
@@ -712,24 +813,20 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
 
             self._append_log(
                 "[BOX] "
+                f"front={_vec_text(box_debug['front_center_base'])} "
                 f"center={_vec_text(box_debug['box_center_base'])} "
-                f"x={_vec_text(box_debug['x_box_base'])} "
-                f"y={_vec_text(box_debug['y_box_base'])} "
-                f"z={_vec_text(box_debug['z_box_base'])} "
-                f"assign={assignment['left']}->{assignment['right']}"
+                f"left_pre={_vec_text(candidates['left']['pregrasp_base'])} "
+                f"right_pre={_vec_text(candidates['right']['pregrasp_base'])}"
             )
 
             self.result_label.setText(
                 "box frame ready | "
+                f"front {_vec_text(box_debug['front_center_base'])} | "
                 f"center {_vec_text(box_debug['box_center_base'])} | "
-                f"x {_vec_text(box_debug['x_box_base'])} | "
-                f"y {_vec_text(box_debug['y_box_base'])} | "
-                f"z {_vec_text(box_debug['z_box_base'])} | "
-                f"inliers {plane_debug['inlier_count']} | "
-                f"face {box_debug['face_span_m']:+.2f}m depth {box_debug['box_depth_m']:+.2f}m | "
-                f"assign {assignment['left']}->{assignment['right']} ({assignment['policy']})"
+                f"left pre {_vec_text(candidates['left']['pregrasp_base'])} | "
+                f"right pre {_vec_text(candidates['right']['pregrasp_base'])}"
             )
-            self._plot_solution(points_base, self._solution)
+            self._plot_solution(points_car, self._solution)
         except Exception as exc:
             self.result_label.setText(f"生成失败: {exc}")
             self._append_log(f"[BOX] 生成失败: {exc}")
