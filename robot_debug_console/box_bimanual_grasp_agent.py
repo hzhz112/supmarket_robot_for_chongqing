@@ -19,6 +19,9 @@ BOX_HEIGHT_M = 0.17
 BOX_CLASS_ALIASES = {"box", "xiangzi", "carton", "crate", "boxy"}
 BOX_READY_LEFT_ARM_DEG = (15.8, 22.5, -19.3, -100.4, -22.7, -12.4, 6.9)
 BOX_READY_RIGHT_ARM_DEG = (-15.7, -14.6, 16.0, 103.1, 16.0, 15.0, -1.7)
+BOX_DEXTEROUS_READY_RIGHT_ARM_DEG = (100.0, 0.0, 255.0, 255.0, 255.0, 255.0, 255.0)
+LEFT_ARM_JOINTS = ("ljoint1", "ljoint2", "ljoint3", "ljoint4", "ljoint5", "ljoint6", "ljoint7")
+RIGHT_ARM_JOINTS = ("rjoint1", "rjoint2", "rjoint3", "rjoint4", "rjoint5", "rjoint6", "rjoint7")
 
 
 def _normalize(vec: np.ndarray) -> np.ndarray:
@@ -291,11 +294,12 @@ def generate_side_grasp_candidates(
     if front_center_base is not None and box_center_base is not None:
         front_center_base = np.asarray(front_center_base, dtype=np.float64).reshape(3)
         box_center_base = np.asarray(box_center_base, dtype=np.float64).reshape(3)
-        grasp_x = float(front_center_base[0])
+        left_grasp_x = float(front_center_base[0])
+        right_grasp_x = float(box_center_base[0])-0.05
         grasp_z = float(box_center_base[2] + grasp_z_offset_m)
         grasp_y_offset = 0.5 * face_span_m
-        left_grasp_base = np.array([grasp_x, box_center_base[1] + grasp_y_offset, grasp_z], dtype=np.float64)
-        right_grasp_base = np.array([grasp_x, box_center_base[1] - grasp_y_offset, grasp_z], dtype=np.float64)
+        left_grasp_base = np.array([left_grasp_x, box_center_base[1] + grasp_y_offset, grasp_z], dtype=np.float64)
+        right_grasp_base = np.array([right_grasp_x, box_center_base[1] - grasp_y_offset, grasp_z], dtype=np.float64)
         left_pre_base = left_grasp_base + np.array([0.0, +float(pregrasp_dist_m), 0.0], dtype=np.float64)
         right_pre_base = right_grasp_base + np.array([0.0, -float(pregrasp_dist_m), 0.0], dtype=np.float64)
         use_direct_base = True
@@ -447,6 +451,7 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         self.generate_btn = QtWidgets.QPushButton("生成预抓取点")
         self.refresh_btn = QtWidgets.QPushButton("刷新视图")
         self.ready_pose_btn = QtWidgets.QPushButton("箱子初始姿态")
+        self.dexterous_ready_btn = QtWidgets.QPushButton("灵巧收位置")
         self.left_pregrasp_btn = QtWidgets.QPushButton("左手预抓取")
         self.left_forward_btn = QtWidgets.QPushButton("左手前进")
         self.right_pregrasp_btn = QtWidgets.QPushButton("右手预抓取")
@@ -456,6 +461,7 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         self.generate_btn.clicked.connect(self.generate)
         self.refresh_btn.clicked.connect(self.refresh_view)
         self.ready_pose_btn.clicked.connect(self.send_box_ready_pose)
+        self.dexterous_ready_btn.clicked.connect(self.send_dexterous_ready_pose)
         self.left_pregrasp_btn.clicked.connect(lambda: self.send_box_arm_target("left", "pregrasp"))
         self.left_forward_btn.clicked.connect(lambda: self.send_box_arm_target("left", "grasp"))
         self.right_pregrasp_btn.clicked.connect(lambda: self.send_box_arm_target("right", "pregrasp"))
@@ -474,6 +480,7 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         controls.addWidget(self.generate_btn, 2, 0)
         controls.addWidget(self.refresh_btn, 2, 1)
         controls.addWidget(self.ready_pose_btn, 2, 2)
+        controls.addWidget(self.dexterous_ready_btn, 2, 3)
         controls.addWidget(self.left_pregrasp_btn, 3, 0)
         controls.addWidget(self.left_forward_btn, 3, 1)
         controls.addWidget(self.right_pregrasp_btn, 3, 2)
@@ -751,6 +758,36 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         except Exception as exc:
             self.result_label.setText(f"箱子初始姿态发送失败: {exc}")
             self._append_log(f"[BOX] 箱子初始姿态发送失败: {exc}")
+
+    def send_dexterous_ready_pose(self) -> None:
+        try:
+            snap = self._host._backend.snapshot()
+            left_current = snap.arm_joint_values(LEFT_ARM_JOINTS)
+            right_current = snap.arm_joint_values(RIGHT_ARM_JOINTS)
+            if any(value is None for value in right_current) or any(value is None for value in left_current):
+                raise ValueError("当前关节状态不完整，无法发送灵巧收位置")
+
+            right_target_deg = list(float(value) for value in BOX_DEXTEROUS_READY_RIGHT_ARM_DEG)
+            merged_right = []
+            for current_value, target_value in zip(right_current, right_target_deg):
+                if target_value == 255.0:
+                    merged_right.append(float(current_value))
+                else:
+                    merged_right.append(math.radians(target_value))
+
+            self._host._backend.send(
+                "arm_joint",
+                left=tuple(float(value) for value in left_current if value is not None),
+                right=tuple(merged_right),
+                vel=0.30,
+                acc=0.50,
+            )
+            text = "已发送灵巧收位置 | 右 " + " ".join(f"{value:+.1f}" for value in BOX_DEXTEROUS_READY_RIGHT_ARM_DEG)
+            self.result_label.setText(text)
+            self._append_log("[BOX] " + text)
+        except Exception as exc:
+            self.result_label.setText(f"灵巧收位置发送失败: {exc}")
+            self._append_log(f"[BOX] 灵巧收位置发送失败: {exc}")
 
     def generate(self) -> None:
         try:
