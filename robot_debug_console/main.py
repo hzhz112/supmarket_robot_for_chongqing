@@ -35,6 +35,11 @@ from tf2_ros import Buffer, TransformListener
 from robot_control_msg.msg import ArmMotionStatus, ArmPowerStatus, EndEffectorPose, LegMotionStatus, LegPowerStatus, Robotarmjoint, Robotarmservomsg, Robotlegjoint, Robotservomsg
 from robot_control_msg.srv import CartesianAbsoluteControl, JointAbsoluteControl, LegAbsoluteControl, LegCartesianControl, SetRobotPower
 
+try:
+    from .box_bimanual_grasp_agent import build_box_bimanual_grasp_page
+except ImportError:
+    from box_bimanual_grasp_agent import build_box_bimanual_grasp_page
+
 
 ARM_JOINTS = ("ljoint1", "ljoint2", "ljoint3", "ljoint4", "ljoint5", "ljoint6", "ljoint7", "rjoint1", "rjoint2", "rjoint3", "rjoint4", "rjoint5", "rjoint6", "rjoint7")
 LEFT_ARM_JOINTS = ARM_JOINTS[:7]
@@ -601,8 +606,6 @@ class BaseTeleopPanel(QtWidgets.QGroupBox):
         self._backend = backend
         self._pressed: set[int] = set()
         self._last_active = False
-        self._linear_speed = 0.20
-        self._angular_speed = 0.70
 
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self.setAttribute(QtCore.Qt.WA_InputMethodEnabled, False)
@@ -610,6 +613,26 @@ class BaseTeleopPanel(QtWidgets.QGroupBox):
         layout = QtWidgets.QVBoxLayout(self)
         self.tip_label = QtWidgets.QLabel("点击本页后，按住 W/A/S/D 控制底盘，松开自动停止。")
         self.tip_label.setWordWrap(True)
+        speed_row = QtWidgets.QHBoxLayout()
+        self.linear_speed_spin = QtWidgets.QDoubleSpinBox()
+        self.linear_speed_spin.setRange(0.01, 1.00)
+        self.linear_speed_spin.setDecimals(2)
+        self.linear_speed_spin.setSingleStep(0.05)
+        self.linear_speed_spin.setValue(0.20)
+        self.linear_speed_spin.setSuffix(" m/s")
+        self.linear_speed_spin.setToolTip("W/S 前进后退速度")
+        self.angular_speed_spin = QtWidgets.QDoubleSpinBox()
+        self.angular_speed_spin.setRange(0.05, 3.00)
+        self.angular_speed_spin.setDecimals(2)
+        self.angular_speed_spin.setSingleStep(0.05)
+        self.angular_speed_spin.setValue(0.70)
+        self.angular_speed_spin.setSuffix(" rad/s")
+        self.angular_speed_spin.setToolTip("A/D 原地转向速度")
+        speed_row.addWidget(QtWidgets.QLabel("前进速度"))
+        speed_row.addWidget(self.linear_speed_spin)
+        speed_row.addWidget(QtWidgets.QLabel("转向速度"))
+        speed_row.addWidget(self.angular_speed_spin)
+        speed_row.addStretch(1)
         self.state_label = QtWidgets.QLabel("当前：停止")
         self.state_label.setWordWrap(True)
         self.log_view = QtWidgets.QTextEdit()
@@ -617,6 +640,7 @@ class BaseTeleopPanel(QtWidgets.QGroupBox):
         self.log_view.setFocusPolicy(QtCore.Qt.NoFocus)
         self.log_view.setMaximumHeight(120)
         layout.addWidget(self.tip_label)
+        layout.addLayout(speed_row)
         layout.addWidget(self.state_label)
         layout.addWidget(self.log_view)
         layout.addStretch(1)
@@ -641,8 +665,8 @@ class BaseTeleopPanel(QtWidgets.QGroupBox):
     def _tick(self) -> None:
         forward = (QtCore.Qt.Key_W in self._pressed) - (QtCore.Qt.Key_S in self._pressed)
         turn = (QtCore.Qt.Key_A in self._pressed) - (QtCore.Qt.Key_D in self._pressed)
-        linear_x = self._linear_speed * float(forward)
-        angular_z = self._angular_speed * float(turn)
+        linear_x = float(self.linear_speed_spin.value()) * float(forward)
+        angular_z = float(self.angular_speed_spin.value()) * float(turn)
         active = bool(forward or turn)
         if active:
             self._publish(linear_x, angular_z)
@@ -1153,6 +1177,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self._post_grasp_reset_arm: Optional[str] = None
         self._post_grasp_reset_lift_target: Optional[tuple[float, ...]] = None
         self._post_grasp_reset_back_target: Optional[tuple[float, ...]] = None
+        self._box_grasp_page = None
         self._pending_logs: list[str] = []
         self._load_extrinsic_transform()
 
@@ -1216,6 +1241,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self._build_base_teleop_page(), "底盘 WSAD")
         self.tabs.addTab(self._build_cartesian_page(), "DMP（关节 / 笛卡尔）")
         self.tabs.addTab(self._build_vision_page(), "视觉 YOLO")
+        self.tabs.addTab(self._build_box_grasp_page(), "grasp box")
         self.tabs.addTab(self._build_grasp_page(), "瓶子抓取")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         outer.addWidget(self.tabs, 1)
@@ -1500,7 +1526,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self.vision_model_combo.currentIndexChanged.connect(self._on_vision_model_changed)
         self.vision_class_combo = QtWidgets.QComboBox()
         self.vision_class_combo.setEditable(True)
-        self.vision_class_combo.addItems(["guazi", "xiangzi", "bottle", "ear"])
+        self.vision_class_combo.addItems(["guazi", "xiangzi", "box", "bottle", "ear"])
         self.vision_class_combo.setCurrentText("guazi")
         self.vision_class_combo.setToolTip("可输入具体标签或 all；右手标签会自动强制右臂，其余标签按当前手臂抓取")
         self.vision_detect_btn = QtWidgets.QPushButton("识别并输出坐标")
@@ -1558,6 +1584,8 @@ class DmpMainWindow(QtWidgets.QMainWindow):
                 default_class = "guazi"
             elif model_name == "best_xiangzi.pt":
                 default_class = "xiangzi"
+            elif "box" in model_name:
+                default_class = "box"
             elif model_name == "ear.pt":
                 default_class = "ear"
             else:
@@ -1567,7 +1595,13 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             self.vision_result_label.setText("模型已切换，请重新识别")
         if hasattr(self, "grasp_result_label"):
             self.grasp_result_label.setText("请重新识别目标后生成抓取姿态")
+        if hasattr(self, "_box_grasp_page") and self._box_grasp_page is not None:
+            self._box_grasp_page.reset_from_vision("模型已切换，请重新识别箱体")
         self.append_log("[VISION] 模型已切换，等待重新加载")
+
+    def _build_box_grasp_page(self) -> QtWidgets.QWidget:
+        self._box_grasp_page = build_box_bimanual_grasp_page(self)
+        return self._box_grasp_page
 
     def _build_grasp_page(self) -> QtWidgets.QWidget:
         """构造通用物体抓取页。
@@ -3573,7 +3607,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, _quit)
     signal.signal(signal.SIGTERM, _quit)
 
-    window.show()
+    window.showMaximized()
     code = app.exec_()
     backend.stop()
     return code
