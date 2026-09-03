@@ -12,7 +12,11 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
+ROBOT_CONTROLLER_ROOT = Path("/home/test/robot_controller")
 for candidate in (
+    ROBOT_CONTROLLER_ROOT / "install" / "local" / "lib" / "python3.10" / "dist-packages",
+    ROBOT_CONTROLLER_ROOT / "install" / "lib" / "python3.10" / "site-packages",
+    ROBOT_CONTROLLER_ROOT / "src",
     ROOT / "Code" / "movement_primitives",
     ROOT / "ros2_robot_controller_runtime" / "src",
     ROOT / "ros2_control_source_partial",

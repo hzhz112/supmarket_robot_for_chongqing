@@ -16,7 +16,21 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from pathlib import Path
 from typing import Iterable, Sequence
+
+ROOT = Path(__file__).resolve().parents[1]
+ROBOT_CONTROLLER_ROOT = Path("/home/test/robot_controller")
+for candidate in (
+    ROBOT_CONTROLLER_ROOT / "install" / "local" / "lib" / "python3.10" / "dist-packages",
+    ROBOT_CONTROLLER_ROOT / "install" / "lib" / "python3.10" / "site-packages",
+    ROBOT_CONTROLLER_ROOT / "src",
+    ROOT / "ros2_robot_controller_runtime" / "src",
+    ROOT / "ros2_control_source_partial",
+    ROOT / "ros2_robot_controller_runtime" / "install" / "local" / "lib" / "python3.10" / "dist-packages",
+):
+    if candidate.exists() and str(candidate) not in sys.path:
+        sys.path.insert(0, str(candidate))
 
 import rclpy
 from rclpy.node import Node
@@ -30,10 +44,13 @@ from robot_control_msg.msg import (
     Robotlegjoint,
     Robotservomsg,
 )
+from robot_control_msg.srv import SetSystemControlMode
 
 
 DEFAULT_REPEAT = 5
 DEFAULT_SETTLE_SEC = 0.05
+ROBOT_CONTROL_OWNER = 1
+ROBOT_CONTROL_MASK_JOINT = 4
 
 EXAMPLE_LEFT_ARM = [0.0, 0.20, 0.0, -1.00, 0.0, 0.0, 0.0]
 EXAMPLE_RIGHT_ARM = [0.0, -0.20, 0.0, 1.00, 0.0, 0.0, 0.0]
@@ -48,6 +65,7 @@ class RobotOperationPublisher(Node):
 
         self._robot_power_pub = self.create_publisher(Bool, "/robot_poweron", 10)
         self._arm_mode_pub = self.create_publisher(UInt8, "/whole/control_mode_cmd", 10)
+        self._control_mode_client = self.create_client(SetSystemControlMode, "/robot_system_manager/set_mode")
 
         self._arm_joint_pub = self.create_publisher(
             Robotarmjoint,
@@ -91,6 +109,22 @@ class RobotOperationPublisher(Node):
     def _on_leg_status(self, msg: LegMotionStatus) -> None:
         self._leg_status = msg
 
+    def _set_robot_control_mode(self, robot_control_mask: int) -> None:
+        req = SetSystemControlMode.Request()
+        req.mode = ROBOT_CONTROL_OWNER
+        req.robot_control_mask = int(robot_control_mask)
+        req.enable_leg_control = False
+        req.enable_waist_control = False
+        if not self._control_mode_client.wait_for_service(timeout_sec=2.0):
+            raise TimeoutError("service unavailable: /robot_system_manager/set_mode")
+        future = self._control_mode_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
+        if not future.done() or future.result() is None:
+            raise RuntimeError("/robot_system_manager/set_mode returned no result")
+        result = future.result()
+        if not bool(getattr(result, "success", False)):
+            raise RuntimeError(f"failed to set control mode mask={int(robot_control_mask)}: {getattr(result, 'message', '')}")
+
     def set_robot_power(
         self,
         enabled: bool,
@@ -132,6 +166,7 @@ class RobotOperationPublisher(Node):
         settle_sec: float = DEFAULT_SETTLE_SEC,
     ) -> None:
         """Publish absolute 7-DOF left arm + 7-DOF right arm joint target."""
+        self._set_robot_control_mode(ROBOT_CONTROL_MASK_JOINT)
         left = _require_count(left_joints, 7, "left_joints")
         right = _require_count(right_joints, 7, "right_joints")
 
@@ -158,6 +193,7 @@ class RobotOperationPublisher(Node):
         settle_sec: float = DEFAULT_SETTLE_SEC,
     ) -> None:
         """Publish low-level 14-joint arm position target."""
+        self._set_robot_control_mode(ROBOT_CONTROL_MASK_JOINT)
         left = _require_count(left_joints, 7, "left_joints")
         right = _require_count(right_joints, 7, "right_joints")
 

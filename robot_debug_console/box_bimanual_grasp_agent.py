@@ -17,11 +17,26 @@ BOX_LENGTH_M = 0.48
 BOX_WIDTH_M = 0.35
 BOX_HEIGHT_M = 0.17
 BOX_CLASS_ALIASES = {"box", "xiangzi", "carton", "crate", "boxy"}
-BOX_READY_LEFT_ARM_DEG = (15.8, 22.5, -19.3, -100.4, -22.7, -12.4, 6.9)
-BOX_READY_RIGHT_ARM_DEG = (-15.7, -14.6, 16.0, 103.1, 16.0, 15.0, -1.7)
+BOX_READY_LEFT_ARM_DEG = (15.8, 22.5, -24.7, -106.5, -27.0, -13.5, 5.6)
+BOX_READY_RIGHT_ARM_DEG = (-15.6, -18.7, 19.1, 110.0, 25.0, 14.0, -14.7)
+BOX_READY_LAYER2_LEFT_ARM_DEG = (8.6, 28.6, -29.2, -110.0, -35.6, -14.2, 22.2)
+BOX_READY_LAYER2_RIGHT_ARM_DEG = (-14.2, -20.6, 29.6, 117.2, 33.9, 14.2, -16.7)
 BOX_DEXTEROUS_READY_RIGHT_ARM_DEG = (100.0, 0.0, 255.0, 255.0, 255.0, 255.0, 255.0)
 LEFT_ARM_JOINTS = ("ljoint1", "ljoint2", "ljoint3", "ljoint4", "ljoint5", "ljoint6", "ljoint7")
 RIGHT_ARM_JOINTS = ("rjoint1", "rjoint2", "rjoint3", "rjoint4", "rjoint5", "rjoint6", "rjoint7")
+BOX_FRONT_PLANE_THRESHOLD_M = 0.012
+BOX_MAX_PLOT_POINTS = 3500
+BOX_LEFT_PREGRASP_DISTANCE_M = 0.07 #左手的预备抓取距离
+BOX_RIGHT_PREGRASP_DISTANCE_M = 0.05 #右手的预备抓取距离
+BOX_LEFT_FORWARD_DISTANCE_M = 0.11
+BOX_RIGHT_FORWARD_DISTANCE_M = 0.11
+BOX_LEFT_PREGRASP_X_OFFSET_M = -0.04
+BOX_RIGHT_PREGRASP_X_OFFSET_M = 0.03
+BOX_LEFT_GRASP_Z_OFFSET_M = 0.03
+BOX_RIGHT_GRASP_Z_OFFSET_M = -0.01
+BOX_HAND_POSE = (100, 0, 255, 255, 255, 255, 255)
+BOX_LIFT_DISTANCE_M = 0.10
+BOX_ARM_Z_STEP_M = 0.05
 
 
 def _normalize(vec: np.ndarray) -> np.ndarray:
@@ -294,14 +309,25 @@ def generate_side_grasp_candidates(
     if front_center_base is not None and box_center_base is not None:
         front_center_base = np.asarray(front_center_base, dtype=np.float64).reshape(3)
         box_center_base = np.asarray(box_center_base, dtype=np.float64).reshape(3)
-        left_grasp_x = float(front_center_base[0])
-        right_grasp_x = float(box_center_base[0])-0.05
+        # 左右夹爪的 X 坐标都取箱体 front 中心的 X（例如 +0.2802）。
+        left_front_x = float(front_center_base[0])
+        left_grasp_x = left_front_x
+        right_grasp_x = float(front_center_base[0])
         grasp_z = float(box_center_base[2] + grasp_z_offset_m)
         grasp_y_offset = 0.5 * face_span_m
-        left_grasp_base = np.array([left_grasp_x, box_center_base[1] + grasp_y_offset, grasp_z], dtype=np.float64)
+        left_side_y = float(box_center_base[1] + grasp_y_offset)
+        left_pre_y = left_side_y + float(pregrasp_dist_m)
+        left_grasp_y = left_side_y
+        left_grasp_base = np.array([left_grasp_x, left_grasp_y, grasp_z], dtype=np.float64)
         right_grasp_base = np.array([right_grasp_x, box_center_base[1] - grasp_y_offset, grasp_z], dtype=np.float64)
-        left_pre_base = left_grasp_base + np.array([0.0, +float(pregrasp_dist_m), 0.0], dtype=np.float64)
-        right_pre_base = right_grasp_base + np.array([0.0, -float(pregrasp_dist_m), 0.0], dtype=np.float64)
+        # 左手预抓取 X 取箱体中心 X 向外偏移 3 cm。
+        left_pre_x = float(box_center_base[0]) + BOX_LEFT_PREGRASP_X_OFFSET_M
+        left_pre_base = np.array([left_pre_x, left_pre_y, grasp_z], dtype=np.float64)
+        right_pre_x = float(front_center_base[0]) + BOX_RIGHT_PREGRASP_X_OFFSET_M
+        right_pre_base = np.array(
+            [right_pre_x, box_center_base[1] - grasp_y_offset - float(pregrasp_dist_m), grasp_z],
+            dtype=np.float64,
+        )
         use_direct_base = True
     else:
         grasp_x = float(grasp_x_offset_m)
@@ -422,71 +448,50 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
 
         control_box = QtWidgets.QGroupBox("grasp box")
         controls = QtWidgets.QGridLayout(control_box)
-        self.pregrasp_spin = QtWidgets.QDoubleSpinBox()
-        self.pregrasp_spin.setRange(0.03, 0.20)
-        self.pregrasp_spin.setDecimals(3)
-        self.pregrasp_spin.setSingleStep(0.005)
-        self.pregrasp_spin.setValue(0.08)
-        self.pregrasp_spin.setSuffix(" m")
-
-        self.grasp_z_spin = QtWidgets.QDoubleSpinBox()
-        self.grasp_z_spin.setRange(-0.12, 0.12)
-        self.grasp_z_spin.setDecimals(3)
-        self.grasp_z_spin.setSingleStep(0.005)
-        self.grasp_z_spin.setValue(0.0)
-        self.grasp_z_spin.setSuffix(" m")
-
-        self.front_threshold_spin = QtWidgets.QDoubleSpinBox()
-        self.front_threshold_spin.setRange(0.004, 0.030)
-        self.front_threshold_spin.setDecimals(3)
-        self.front_threshold_spin.setSingleStep(0.001)
-        self.front_threshold_spin.setValue(0.012)
-        self.front_threshold_spin.setSuffix(" m")
-
-        self.max_plot_points_spin = QtWidgets.QSpinBox()
-        self.max_plot_points_spin.setRange(500, 20000)
-        self.max_plot_points_spin.setSingleStep(500)
-        self.max_plot_points_spin.setValue(3500)
+        self.left_pregrasp_spin = QtWidgets.QDoubleSpinBox(); self.left_pregrasp_spin.setRange(0.01, 0.20); self.left_pregrasp_spin.setDecimals(3); self.left_pregrasp_spin.setValue(BOX_LEFT_PREGRASP_DISTANCE_M); self.left_pregrasp_spin.setSuffix(" m")
+        self.right_pregrasp_spin = QtWidgets.QDoubleSpinBox(); self.right_pregrasp_spin.setRange(0.01, 0.20); self.right_pregrasp_spin.setDecimals(3); self.right_pregrasp_spin.setValue(BOX_RIGHT_PREGRASP_DISTANCE_M); self.right_pregrasp_spin.setSuffix(" m")
+        self.left_grasp_z_spin = QtWidgets.QDoubleSpinBox(); self.left_grasp_z_spin.setRange(-0.12, 0.12); self.left_grasp_z_spin.setDecimals(3); self.left_grasp_z_spin.setValue(BOX_LEFT_GRASP_Z_OFFSET_M); self.left_grasp_z_spin.setSuffix(" m")
+        self.right_grasp_z_spin = QtWidgets.QDoubleSpinBox(); self.right_grasp_z_spin.setRange(-0.12, 0.12); self.right_grasp_z_spin.setDecimals(3); self.right_grasp_z_spin.setValue(BOX_RIGHT_GRASP_Z_OFFSET_M); self.right_grasp_z_spin.setSuffix(" m")
 
         self.generate_btn = QtWidgets.QPushButton("生成预抓取点")
         self.refresh_btn = QtWidgets.QPushButton("刷新视图")
         self.ready_pose_btn = QtWidgets.QPushButton("箱子初始姿态")
-        self.dexterous_ready_btn = QtWidgets.QPushButton("灵巧收位置")
+        self.layer2_ready_pose_btn = QtWidgets.QPushButton("第二层箱子初始姿态")
+        self.hand_pose_btn = QtWidgets.QPushButton("灵巧手姿势")
+        self.hand_pose_btn.clicked.connect(self.send_hand_pose)
         self.left_pregrasp_btn = QtWidgets.QPushButton("左手预抓取")
         self.left_forward_btn = QtWidgets.QPushButton("左手前进")
         self.right_pregrasp_btn = QtWidgets.QPushButton("右手预抓取")
         self.right_forward_btn = QtWidgets.QPushButton("右手前进")
         self.both_pregrasp_btn = QtWidgets.QPushButton("双手预抓取")
-        self.both_forward_btn = QtWidgets.QPushButton("双手前进")
+        self.both_arm_z_up_btn = QtWidgets.QPushButton("双手 Z 轴上移 5cm")
+        self.both_arm_z_down_btn = QtWidgets.QPushButton("双手 Z 轴下移 5cm")
+        self.both_lift_btn = QtWidgets.QPushButton("腰部上升 10cm")
+        self.both_lower_btn = QtWidgets.QPushButton("腰部下降 10cm")
         self.generate_btn.clicked.connect(self.generate)
         self.refresh_btn.clicked.connect(self.refresh_view)
         self.ready_pose_btn.clicked.connect(self.send_box_ready_pose)
-        self.dexterous_ready_btn.clicked.connect(self.send_dexterous_ready_pose)
+        self.layer2_ready_pose_btn.clicked.connect(self.send_layer2_ready_pose)
         self.left_pregrasp_btn.clicked.connect(lambda: self.send_box_arm_target("left", "pregrasp"))
         self.left_forward_btn.clicked.connect(lambda: self.send_box_arm_target("left", "grasp"))
         self.right_pregrasp_btn.clicked.connect(lambda: self.send_box_arm_target("right", "pregrasp"))
         self.right_forward_btn.clicked.connect(lambda: self.send_box_arm_target("right", "grasp"))
         self.both_pregrasp_btn.clicked.connect(lambda: self.send_box_both_targets("pregrasp"))
-        self.both_forward_btn.clicked.connect(lambda: self.send_box_both_targets("grasp"))
+        self.both_arm_z_up_btn.clicked.connect(lambda: self.send_both_arm_z_offset(BOX_ARM_Z_STEP_M))
+        self.both_arm_z_down_btn.clicked.connect(lambda: self.send_both_arm_z_offset(-BOX_ARM_Z_STEP_M))
+        self.both_lift_btn.clicked.connect(lambda: self.send_leg_lift(BOX_LIFT_DISTANCE_M))
+        self.both_lower_btn.clicked.connect(lambda: self.send_leg_lift(-BOX_LIFT_DISTANCE_M))
 
-        controls.addWidget(QtWidgets.QLabel("预抓取距离"), 0, 0)
-        controls.addWidget(self.pregrasp_spin, 0, 1)
-        controls.addWidget(QtWidgets.QLabel("抓取高度偏移"), 0, 2)
-        controls.addWidget(self.grasp_z_spin, 0, 3)
-        controls.addWidget(QtWidgets.QLabel("平面阈值"), 1, 0)
-        controls.addWidget(self.front_threshold_spin, 1, 1)
-        controls.addWidget(QtWidgets.QLabel("点云采样上限"), 1, 2)
-        controls.addWidget(self.max_plot_points_spin, 1, 3)
-        controls.addWidget(self.generate_btn, 2, 0)
-        controls.addWidget(self.refresh_btn, 2, 1)
-        controls.addWidget(self.ready_pose_btn, 2, 2)
-        controls.addWidget(self.dexterous_ready_btn, 2, 3)
-        controls.addWidget(self.left_pregrasp_btn, 3, 0)
-        controls.addWidget(self.left_forward_btn, 3, 1)
-        controls.addWidget(self.right_pregrasp_btn, 3, 2)
-        controls.addWidget(self.right_forward_btn, 3, 3)
-        controls.addWidget(self.both_pregrasp_btn, 4, 0, 1, 2)
-        controls.addWidget(self.both_forward_btn, 4, 2, 1, 2)
+        controls.addWidget(QtWidgets.QLabel("左手预抓取距离"), 0, 0); controls.addWidget(self.left_pregrasp_spin, 0, 1)
+        controls.addWidget(QtWidgets.QLabel("左手抓取高度"), 0, 2); controls.addWidget(self.left_grasp_z_spin, 0, 3)
+        controls.addWidget(QtWidgets.QLabel("右手预抓取距离"), 1, 0); controls.addWidget(self.right_pregrasp_spin, 1, 1)
+        controls.addWidget(QtWidgets.QLabel("右手抓取高度"), 1, 2); controls.addWidget(self.right_grasp_z_spin, 1, 3)
+        controls.addWidget(self.generate_btn, 2, 0); controls.addWidget(self.refresh_btn, 2, 1); controls.addWidget(self.ready_pose_btn, 2, 2); controls.addWidget(self.hand_pose_btn, 2, 3)
+        controls.addWidget(self.layer2_ready_pose_btn, 3, 0, 1, 2)
+        controls.addWidget(self.left_pregrasp_btn, 4, 0); controls.addWidget(self.left_forward_btn, 4, 1); controls.addWidget(self.right_pregrasp_btn, 4, 2); controls.addWidget(self.right_forward_btn, 4, 3)
+        controls.addWidget(self.both_pregrasp_btn, 5, 0, 1, 2)
+        controls.addWidget(self.both_arm_z_up_btn, 6, 0); controls.addWidget(self.both_arm_z_down_btn, 6, 1)
+        controls.addWidget(self.both_lift_btn, 7, 0, 1, 2); controls.addWidget(self.both_lower_btn, 7, 2, 1, 2)
         layout.addWidget(control_box)
 
         self.result_label = QtWidgets.QLabel("请先在 YOLO 页识别 box / xiangzi")
@@ -494,11 +499,15 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         self.result_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(self.result_label)
 
+        # 3D 视图由主窗口作为与“grasp box”平级的标签页承载。
         self.figure = Figure(figsize=(10.6, 8.8), dpi=100)
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setMinimumHeight(420)
         self.canvas.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        layout.addWidget(self.canvas, 1)
+        self.visual_page = QtWidgets.QWidget()
+        visual_layout = QtWidgets.QVBoxLayout(self.visual_page)
+        visual_layout.setContentsMargins(0, 0, 0, 0)
+        visual_layout.addWidget(self.canvas)
 
     def reset_from_vision(self, message: str = "已切换模型，请重新识别箱体") -> None:
         self._solution = None
@@ -513,6 +522,30 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
             return
         if hasattr(self._host, "append_log"):
             self._host.append_log(text)
+
+    def send_hand_pose(self) -> None:
+        try:
+            self._host._run_right_hand_custom_pose(BOX_HAND_POSE)
+            text = "已发送灵巧手姿势: " + " ".join(map(str, BOX_HAND_POSE))
+            self.result_label.setText(text); self._append_log("[BOX] " + text)
+        except Exception as exc:
+            self.result_label.setText(f"灵巧手姿势发送失败: {exc}"); self._append_log(f"[BOX] 灵巧手姿势发送失败: {exc}")
+
+    def send_dexterous_ready_pose(self) -> None:
+        """保留旧版灵巧收位置接口，供已有外部调用使用。"""
+        try:
+            snap = self._host._backend.snapshot()
+            left_current = snap.arm_joint_values(LEFT_ARM_JOINTS)
+            right_current = snap.arm_joint_values(RIGHT_ARM_JOINTS)
+            if any(value is None for value in right_current) or any(value is None for value in left_current):
+                raise ValueError("当前关节状态不完整，无法发送灵巧收位置")
+            merged_right = [float(current) if target == 255.0 else math.radians(target)
+                            for current, target in zip(right_current, BOX_DEXTEROUS_READY_RIGHT_ARM_DEG)]
+            self._host._backend.send("arm_joint", left=tuple(left_current), right=tuple(merged_right), vel=0.30, acc=0.50)
+            text = "已发送灵巧收位置 | 右 " + " ".join(f"{value:+.1f}" for value in BOX_DEXTEROUS_READY_RIGHT_ARM_DEG)
+            self.result_label.setText(text); self._append_log("[BOX] " + text)
+        except Exception as exc:
+            self.result_label.setText(f"灵巧收位置发送失败: {exc}"); self._append_log(f"[BOX] 灵巧收位置发送失败: {exc}")
 
     def _current_target(self) -> dict[str, Any]:
         target = getattr(self._host, "_vision_target", None)
@@ -575,7 +608,7 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         ax = self.figure.add_subplot(111, projection="3d")
 
         points = _ensure_points_array(points_base)
-        max_points = int(self.max_plot_points_spin.value())
+        max_points = BOX_MAX_PLOT_POINTS
         if len(points) > max_points:
             rng = np.random.default_rng(7)
             sample_idx = rng.choice(len(points), max_points, replace=False)
@@ -709,6 +742,16 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         try:
             left, right = self._current_arm_targets()
             target = self._solution_pose_for_arm(arm, stage)
+            if arm == "left" and stage == "grasp":
+                # 左手前进采用相对运动：从已生成的左手预抓取位姿沿基座 X 轴前进 11 cm。
+                pre = np.asarray(self._solution_pose_for_arm("left", "pregrasp"), dtype=np.float64)
+                target = tuple(float(v) for v in pre.tolist())
+                target = (target[0] + BOX_LEFT_FORWARD_DISTANCE_M, *target[1:])
+            elif arm == "right" and stage == "grasp":
+                # 右手前进采用相对运动：从已生成的右手预抓取位姿沿基座 X 轴前进 12 cm。
+                pre = np.asarray(self._solution_pose_for_arm("right", "pregrasp"), dtype=np.float64)
+                target = tuple(float(v) for v in pre.tolist())
+                target = (target[0] + BOX_RIGHT_FORWARD_DISTANCE_M, *target[1:])
             if arm == "left":
                 left = target
                 label = "左手"
@@ -743,6 +786,37 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
             self.result_label.setText(f"双手发送失败: {exc}")
             self._append_log(f"[BOX] 双手发送失败: {exc}")
 
+    def send_both_arm_z_offset(self, distance_m: float) -> None:
+        """按当前双臂 TCP 位姿，沿基座 Z 轴相对移动指定距离。"""
+        try:
+            left, right = self._current_arm_targets()
+            if len(left) < 3 or len(right) < 3:
+                raise ValueError("当前双臂 TCP 位姿数据不完整")
+            left = (left[0], left[1], left[2] + float(distance_m), *left[3:])
+            right = (right[0], right[1], right[2] + float(distance_m), *right[3:])
+            self._host._backend.send("arm_cartesian", left=left, right=right, vel=0.05, acc=0.10)
+            action = "上移" if distance_m > 0 else "下移"
+            text = f"双手 Z 轴{action} {abs(distance_m) * 100:.0f}cm 已发送"
+            self.result_label.setText(text)
+            self._append_log("[BOX] " + text)
+        except Exception as exc:
+            self.result_label.setText(f"双手 Z 轴移动失败: {exc}")
+            self._append_log(f"[BOX] 双手 Z 轴移动失败: {exc}")
+
+    def send_leg_lift(self, distance_m: float) -> None:
+        """通过腰腿四自由度笛卡尔接口整体升降，当前高度约 0.4 m。"""
+        try:
+            if not self._host._backend.snapshot().leg_pose():
+                raise ValueError("当前腰腿状态还没读全，无法升降")
+            self._host._backend.send("leg_lift", delta=float(distance_m), waist_delta=0.0, vel=0.08)
+            action = "上升" if distance_m > 0 else "下降"
+            text = f"腰部{action} {abs(distance_m) * 100:.0f}cm 已发送"
+            self.result_label.setText(text)
+            self._append_log("[BOX] " + text)
+        except Exception as exc:
+            self.result_label.setText(f"双手{('抬起' if distance_m > 0 else '放下')}失败: {exc}")
+            self._append_log(f"[BOX] 双手垂直移动失败: {exc}")
+
     def send_box_ready_pose(self) -> None:
         try:
             left = tuple(math.radians(value) for value in BOX_READY_LEFT_ARM_DEG)
@@ -759,35 +833,22 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
             self.result_label.setText(f"箱子初始姿态发送失败: {exc}")
             self._append_log(f"[BOX] 箱子初始姿态发送失败: {exc}")
 
-    def send_dexterous_ready_pose(self) -> None:
+    def send_layer2_ready_pose(self) -> None:
+        """发送第二层箱子的双臂初始姿态。"""
         try:
-            snap = self._host._backend.snapshot()
-            left_current = snap.arm_joint_values(LEFT_ARM_JOINTS)
-            right_current = snap.arm_joint_values(RIGHT_ARM_JOINTS)
-            if any(value is None for value in right_current) or any(value is None for value in left_current):
-                raise ValueError("当前关节状态不完整，无法发送灵巧收位置")
-
-            right_target_deg = list(float(value) for value in BOX_DEXTEROUS_READY_RIGHT_ARM_DEG)
-            merged_right = []
-            for current_value, target_value in zip(right_current, right_target_deg):
-                if target_value == 255.0:
-                    merged_right.append(float(current_value))
-                else:
-                    merged_right.append(math.radians(target_value))
-
-            self._host._backend.send(
-                "arm_joint",
-                left=tuple(float(value) for value in left_current if value is not None),
-                right=tuple(merged_right),
-                vel=0.30,
-                acc=0.50,
+            left = tuple(math.radians(value) for value in BOX_READY_LAYER2_LEFT_ARM_DEG)
+            right = tuple(math.radians(value) for value in BOX_READY_LAYER2_RIGHT_ARM_DEG)
+            self._host._backend.send("arm_joint", left=left, right=right, vel=0.30, acc=0.50)
+            text = (
+                "已发送第二层箱子初始姿态 | "
+                "左 " + " ".join(f"{value:+.1f}" for value in BOX_READY_LAYER2_LEFT_ARM_DEG) + " | "
+                "右 " + " ".join(f"{value:+.1f}" for value in BOX_READY_LAYER2_RIGHT_ARM_DEG)
             )
-            text = "已发送灵巧收位置 | 右 " + " ".join(f"{value:+.1f}" for value in BOX_DEXTEROUS_READY_RIGHT_ARM_DEG)
             self.result_label.setText(text)
             self._append_log("[BOX] " + text)
         except Exception as exc:
-            self.result_label.setText(f"灵巧收位置发送失败: {exc}")
-            self._append_log(f"[BOX] 灵巧收位置发送失败: {exc}")
+            self.result_label.setText(f"第二层箱子初始姿态发送失败: {exc}")
+            self._append_log(f"[BOX] 第二层箱子初始姿态发送失败: {exc}")
 
     def generate(self) -> None:
         try:
@@ -803,7 +864,7 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
                 points_car,
                 preferred_face_span_m=BOX_LENGTH_M,
                 preferred_height_m=BOX_HEIGHT_M,
-                distance_threshold=float(self.front_threshold_spin.value()),
+                distance_threshold=BOX_FRONT_PLANE_THRESHOLD_M,
             )
             T_base_box, box_debug = estimate_box_frame(
                 front_points,
@@ -817,12 +878,18 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
                 T_base_box,
                 face_span_m=float(box_debug["face_span_m"]),
                 box_depth_m=float(box_debug["box_depth_m"]),
-                pregrasp_dist_m=float(self.pregrasp_spin.value()),
-                grasp_z_offset_m=float(self.grasp_z_spin.value()),
+                pregrasp_dist_m=float(self.left_pregrasp_spin.value()),
+                grasp_z_offset_m=float(self.left_grasp_z_spin.value()),
                 grasp_x_offset_m=-0.5 * float(box_debug["box_depth_m"]),
                 front_center_base=box_debug["front_center_base"],
                 box_center_base=box_debug["box_center_base"],
             )
+            # 左右手使用各自独立的预抓取距离和高度偏移。
+            candidates["right"] = generate_side_grasp_candidates(
+                T_base_box, face_span_m=float(box_debug["face_span_m"]), box_depth_m=float(box_debug["box_depth_m"]),
+                pregrasp_dist_m=float(self.right_pregrasp_spin.value()), grasp_z_offset_m=float(self.right_grasp_z_spin.value()),
+                grasp_x_offset_m=-0.5 * float(box_debug["box_depth_m"]), front_center_base=box_debug["front_center_base"], box_center_base=box_debug["box_center_base"],
+            )["right"]
             snap = self._host._backend.snapshot() if hasattr(self._host, "_backend") else None
             left_tcp = None
             right_tcp = None

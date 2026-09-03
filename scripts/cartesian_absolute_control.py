@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
+ROBOT_CONTROLLER_ROOT = Path("/home/test/robot_controller")
 for candidate in (
+    ROBOT_CONTROLLER_ROOT / "install" / "local" / "lib" / "python3.10" / "dist-packages",
+    ROBOT_CONTROLLER_ROOT / "install" / "lib" / "python3.10" / "site-packages",
+    ROBOT_CONTROLLER_ROOT / "src",
     ROOT / "ros2_robot_controller_runtime" / "src",
     ROOT / "ros2_robot_controller_runtime" / "src" / "sailor_r1_pro_description",
     ROOT / "ros2_control_source_partial",
@@ -265,7 +269,7 @@ def build_tcp_from_ee_target(current_ee: ArmCartesianTarget, current_tcp: ArmCar
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Call /cartesian_absolute_control with explicit TCP or raw end-effector targets."
+        description="Call /cartesian_moveP with explicit TCP or raw end-effector targets."
     )
     parser.add_argument("--arm", choices=("left", "right"), help="single-arm mode; the other arm keeps current pose")
     parser.add_argument("--target", type=parse_pose_text, help="single-arm target: x y z [roll pitch yaw]")
@@ -341,13 +345,15 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"vel={args.vel:.3f} acc={args.acc:.3f}")
 
         if not args.execute:
-            print("dry-run only; add --execute to call /cartesian_absolute_control")
+            print("dry-run only; add --execute to call /cartesian_moveP")
             return 0
 
         client.require_arm_power(args.state_timeout)
         service_name, response = client.call_cartesian_absolute(
             left=left_target,
             right=right_target,
+            use_left=args.arm == "left" or args.left is not None,
+            use_right=args.arm == "right" or args.right is not None,
             vel=args.vel,
             acc=args.acc,
             service_wait=args.service_wait,

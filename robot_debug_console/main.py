@@ -46,8 +46,8 @@ LEFT_ARM_JOINTS = ARM_JOINTS[:7]
 RIGHT_ARM_JOINTS = ARM_JOINTS[7:]
 LEG_JOINTS = ("ankle_joint", "knee_joint", "hip_pitch_joint", "hip_yaw_joint")
 LEG_POWER_READY = 39
-RIGHT_HAND_GRASP_LABELS = {"guazi", "xiangzi", "pai", "cui"}
-RIGHT_HAND_TCP_Y_OFFSET_M = -0.10
+RIGHT_HAND_GRASP_LABELS = {"guazi", "pai", "cui"}
+RIGHT_HAND_TCP_Y_OFFSET_M = -0.06
 RIGHT_HAND_PREGRASP_DISTANCE_M = 0.10
 RECORD_IDLE_SECONDS = 2.0
 JOINT_IDLE_EPS_RAD = math.radians(0.2)
@@ -1242,6 +1242,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self._build_cartesian_page(), "DMP（关节 / 笛卡尔）")
         self.tabs.addTab(self._build_vision_page(), "视觉 YOLO")
         self.tabs.addTab(self._build_box_grasp_page(), "grasp box")
+        self.tabs.addTab(self._box_grasp_page.visual_page, "grasp box 3D")
         self.tabs.addTab(self._build_grasp_page(), "瓶子抓取")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         outer.addWidget(self.tabs, 1)
@@ -1516,8 +1517,6 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             ("best.pt（自定义 guazi）", WEIGHT_DIR / "best.pt"),
             ("best_xiangzi.pt（自定义 xiangzi）", WEIGHT_DIR / "best_xiangzi.pt"),
             ("yolo26n-seg.pt（COCO，含 bottle）", WEIGHT_DIR / "yolo26n-seg.pt"),
-            ("ear.pt（ear）", WEIGHT_DIR / "ear.pt"),
-            ("guazi）.pt）", WEIGHT_DIR / "guazi）.pt"),
         )
         for label, model_path in model_choices:
             if model_path.exists():
@@ -1525,9 +1524,11 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self.vision_model_combo.setToolTip("切换模型后需要重新点击“识别并输出坐标”")
         self.vision_model_combo.currentIndexChanged.connect(self._on_vision_model_changed)
         self.vision_class_combo = QtWidgets.QComboBox()
-        self.vision_class_combo.setEditable(True)
-        self.vision_class_combo.addItems(["guazi", "xiangzi", "box", "bottle", "ear"])
-        self.vision_class_combo.setCurrentText("guazi")
+        self.vision_class_combo.setEditable(False)
+        self._vision_label_map = self._load_vision_label_map()
+        for key, display in self._vision_label_map.items():
+            self.vision_class_combo.addItem(display, key)
+        self.vision_class_combo.setCurrentIndex(0)
         self.vision_class_combo.setToolTip("可输入具体标签或 all；右手标签会自动强制右臂，其余标签按当前手臂抓取")
         self.vision_detect_btn = QtWidgets.QPushButton("识别并输出坐标")
         self.vision_capture_status = QtWidgets.QLabel("等待相机图像...")
@@ -1565,6 +1566,20 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         layout.addStretch(1)
         return page
 
+    def _load_vision_label_map(self) -> dict[str, str]:
+        """加载 YOLO 英文标签到中文显示名的映射。"""
+        path = ROOT / "config" / "lable.yaml"
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            if isinstance(data, dict):
+                mapping = {str(key).strip().lower(): str(value).strip() for key, value in data.items() if str(key).strip() and str(value).strip()}
+            else:
+                mapping = {}
+        except Exception as exc:
+            self.append_log(f"[VISION] 标签映射加载失败: {exc}")
+            mapping = {}
+        return mapping
+
     def _on_vision_model_changed(self, _index: int) -> None:
         """切换模型后丢弃旧模型和旧识别结果，避免混用类别表。"""
         self._yolo_model = None
@@ -1590,7 +1605,12 @@ class DmpMainWindow(QtWidgets.QMainWindow):
                 default_class = "ear"
             else:
                 default_class = "bottle"
-            self.vision_class_combo.setCurrentText(default_class)
+            index = self.vision_class_combo.findData(default_class)
+            if index >= 0:
+                self.vision_class_combo.setCurrentIndex(index)
+            elif self.vision_class_combo.count() > 0:
+                # 当前模型没有专属默认标签时，保留一个有效的中文选项。
+                self.vision_class_combo.setCurrentIndex(0)
         if hasattr(self, "vision_result_label"):
             self.vision_result_label.setText("模型已切换，请重新识别")
         if hasattr(self, "grasp_result_label"):
@@ -1627,21 +1647,21 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         controls = QtWidgets.QGridLayout(control_box)
         self.grasp_arm_combo = QtWidgets.QComboBox()
         self.grasp_arm_combo.addItems(["left", "right"])
-        self.grasp_arm_combo.setCurrentText("right")
+        self.grasp_arm_combo.setCurrentText("left")
         self.grasp_height_spin = QtWidgets.QDoubleSpinBox()
         self.grasp_height_spin.setRange(0.35, 0.75)
         self.grasp_height_spin.setSingleStep(0.05)
-        self.grasp_height_spin.setValue(0.55)
+        self.grasp_height_spin.setValue(0.45)
         self.grasp_height_spin.setSuffix("  目标高度比例（通用）")
         self.grasp_forward_spin = QtWidgets.QDoubleSpinBox()
         self.grasp_forward_spin.setRange(0.03, 0.30)
         self.grasp_forward_spin.setSingleStep(0.01)
-        self.grasp_forward_spin.setValue(0.20)
+        self.grasp_forward_spin.setValue(0.08)
         self.grasp_forward_spin.setSuffix(" m")
         self.grasp_contact_gap_spin = QtWidgets.QDoubleSpinBox()
         self.grasp_contact_gap_spin.setRange(1.0, 20.0)
         self.grasp_contact_gap_spin.setSingleStep(1.0)
-        self.grasp_contact_gap_spin.setValue(5.0)
+        self.grasp_contact_gap_spin.setValue(10.0)
         self.grasp_contact_gap_spin.setSuffix(" cm")
         self.grasp_contact_gap_spin.setToolTip("相对步长：向前/向左移动多少厘米")
         self.grasp_generate_btn = QtWidgets.QPushButton("生成预抓取姿态")
@@ -1800,6 +1820,19 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             "--no-open-on-exit",
         ]
         self._start_final_grasp_process(command, f"[GRASP] 右手灵巧手抓取: port={port}")
+
+    def _run_right_hand_custom_pose(self, pose: tuple[int, ...] | list[int]) -> None:
+        """发送指定的右手灵巧手 7 关节位置。"""
+        values = [int(v) for v in pose]
+        if len(values) != 7 or any(v < 0 or v > 255 for v in values):
+            raise ValueError("灵巧手姿势必须是 7 个 0-255 整数")
+        port = self.final_o7_port_input.text().strip() or O7_RS485_PORT
+        command = [
+            sys.executable, "-u", str(O7_RS485_SCRIPT), "--port", port,
+            "--hand_type", "right", "--once", "--position", *[str(v) for v in values],
+            "--no-open-on-exit",
+        ]
+        self._start_final_grasp_process(command, f"[GRASP] 右手灵巧手姿势: {values}, port={port}")
 
     def _run_right_hand_open(self) -> None:
         port = self.final_o7_port_input.text().strip() or O7_RS485_PORT
@@ -2077,12 +2110,10 @@ class DmpMainWindow(QtWidgets.QMainWindow):
 
         pregrasp_distance = float(self.grasp_forward_spin.value())
         final_gap_m = float(final_gap_m)
-        if pregrasp_distance <= 0.10:
-            raise ValueError("预抓取距离必须大于 0.10 m")
+        if pregrasp_distance < 0.05:
+            raise ValueError("预抓取距离不能小于 0.05 m")
         if final_gap_m <= 0.0:
             raise ValueError("最终离目标距离必须大于 0")
-        if final_gap_m >= pregrasp_distance:
-            raise ValueError("最终离目标距离必须小于预抓取距离")
         x_axis = np.asarray(x_axis, dtype=np.float64)
         x_axis /= np.linalg.norm(x_axis)
         pregrasp_position = grasp_position - x_axis * pregrasp_distance
@@ -2119,11 +2150,8 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             raise ValueError("请先点击“生成预抓取姿态”")
 
         final_gap_m = float(self.grasp_contact_gap_spin.value()) / 100.0
-        pregrasp_distance = float(self._grasp_pregrasp_distance_m)
         if final_gap_m <= 0.0:
             raise ValueError("最终离目标距离必须大于 0")
-        if final_gap_m >= pregrasp_distance:
-            raise ValueError("最终离目标距离必须小于预抓取距离")
 
         grasp_position = np.asarray(self._grasp_position, dtype=np.float64)
         rotation = np.asarray(self._grasp_rotation, dtype=np.float64)
@@ -2200,12 +2228,10 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         pregrasp_distance_m = float(self.grasp_forward_spin.value())
         self._grasp_right_side_mode = bool(right_side_mode)
         if right_side_mode:
-            if pregrasp_distance_m <= 0.10:
-                raise ValueError("预抓取距离必须大于 0.10 m")
+            if pregrasp_distance_m < 0.05:
+                raise ValueError("预抓取距离不能小于 0.05 m")
             if final_gap_m <= 0.0:
                 raise ValueError("最终离目标距离必须大于 0")
-            if final_gap_m >= pregrasp_distance_m:
-                raise ValueError("最终离目标距离必须小于预抓取距离")
             self._grasp_contact_axis = None
             self._grasp_pregrasp_distance_m = pregrasp_distance_m
             grasp_pose = (
@@ -2334,14 +2360,8 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         pregrasp_distance_m = RIGHT_HAND_PREGRASP_DISTANCE_M
         pregrasp_position = grasp_position - approach_axis * pregrasp_distance_m
         forward_target_position = grasp_position - approach_axis * final_gap_m
-        if final_gap_m <= 0.0 or final_gap_m >= pregrasp_distance_m:
-            raise ValueError(
-                "右手最终离目标距离必须大于 0 且严格小于右侧预抓取距离 "
-                f"(当前最终距离={final_gap_m * 100:.1f} cm, 预抓取距离={pregrasp_distance_m * 100:.1f} cm, "
-                f"识别位置={grasp_position[0]:+.4f},{grasp_position[1]:+.4f},{grasp_position[2]:+.4f} "
-                f"预抓取位置={pregrasp_position[0]:+.4f},{pregrasp_position[1]:+.4f},{pregrasp_position[2]:+.4f} "
-                f"最终位置={forward_target_position[0]:+.4f},{forward_target_position[1]:+.4f},{forward_target_position[2]:+.4f})"
-            )
+        if final_gap_m <= 0.0:
+            raise ValueError("右手最终离目标距离必须大于 0")
         self._grasp_position = grasp_position.copy()
         self._grasp_right_side_mode = True
         self._grasp_contact_axis = approach_axis.copy()
@@ -2696,23 +2716,21 @@ class DmpMainWindow(QtWidgets.QMainWindow):
                 self._yolo_model = YOLO(str(model_path))
                 self._yolo_model_path = model_path
                 self.append_log(f"[VISION] 已加载 YOLO 分割模型: {model_path}")
-                # 保留两个抓取流程的固定选项，同时补充模型中的其他类别。
-                model_names = [
-                    str(name) for _, name in sorted(self._yolo_model.names.items())
-                ]
-                existing_names = {
-                    self.vision_class_combo.itemText(index).strip().lower()
-                    for index in range(self.vision_class_combo.count())
-                }
-                for name in model_names:
-                    if name.strip().lower() not in existing_names:
-                        self.vision_class_combo.addItem(name)
-
-            target_text = self.vision_class_combo.currentText().strip().lower()
+            # 下拉框显示中文，itemData 保存 YOLO 使用的英文标签。
+            target_text = str(self.vision_class_combo.currentData() or "").strip().lower()
+            if not target_text and self.vision_class_combo.count() > 0:
+                self.vision_class_combo.setCurrentIndex(0)
+                target_text = str(self.vision_class_combo.currentData() or "").strip().lower()
             names = {str(name).lower(): int(index) for index, name in self._yolo_model.names.items()}
             class_ids = None
             if target_text not in {"", "all", "*"}:
-                class_ids = [int(target_text)] if target_text.isdigit() else [names[target_text]]
+                if target_text.isdigit():
+                    class_ids = [int(target_text)]
+                elif target_text not in names:
+                    display = self.vision_class_combo.currentText().strip()
+                    raise ValueError(f"当前模型不包含标签“{display}”（{target_text}）")
+                else:
+                    class_ids = [names[target_text]]
 
             results = self._yolo_model.predict(
                 color_image,

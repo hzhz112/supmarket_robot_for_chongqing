@@ -11,7 +11,11 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
+ROBOT_CONTROLLER_ROOT = Path("/home/test/robot_controller")
 for candidate in (
+    ROBOT_CONTROLLER_ROOT / "install" / "local" / "lib" / "python3.10" / "dist-packages",
+    ROBOT_CONTROLLER_ROOT / "install" / "lib" / "python3.10" / "site-packages",
+    ROBOT_CONTROLLER_ROOT / "src",
     ROOT / "Code" / "movement_primitives",
     ROOT / "ros2_robot_controller_runtime" / "src",
     ROOT / "ros2_control_source_partial",
@@ -45,10 +49,16 @@ from std_msgs.msg import UInt8
 
 from movement_primitives.dmp import DMP
 from robot_control_msg.msg import Robotarmservomsg
+try:
+    from robot_control_msg.srv import SetSystemControlMode
+except ImportError:
+    SetSystemControlMode = None  # type: ignore[assignment]
 
 
 LEFT_ARM_JOINTS = ("ljoint1", "ljoint2", "ljoint3", "ljoint4", "ljoint5", "ljoint6", "ljoint7")
 RIGHT_ARM_JOINTS = ("rjoint1", "rjoint2", "rjoint3", "rjoint4", "rjoint5", "rjoint6", "rjoint7")
+ROBOT_CONTROL_OWNER = 1
+ROBOT_CONTROL_MASK_JOINT = 4
 
 
 def read_demo_csv(path: Path) -> tuple[np.ndarray, dict[str, np.ndarray]]:
@@ -136,6 +146,7 @@ class JointStateHold(Node):
         self.create_subscription(JointState, "/whole/joint_states", self._on_joint_state, 10)
         self._arm_mode_pub = self.create_publisher(UInt8, "/whole/control_mode_cmd", 10)
         self._arm_axis_pub = self.create_publisher(Robotarmservomsg, "/arm_axis_position_cmd", 10)
+        self._control_mode_client = self.create_client(SetSystemControlMode, "/robot_system_manager/set_mode") if SetSystemControlMode is not None else None
 
     def _on_joint_state(self, msg: JointState) -> None:
         for name, position in zip(msg.name, msg.position):
@@ -156,6 +167,27 @@ class JointStateHold(Node):
         msg = UInt8()
         msg.data = 0
         self._arm_mode_pub.publish(msg)
+
+    def set_joint_control_mode(self) -> None:
+        if SetSystemControlMode is None or self._control_mode_client is None:
+            msg = UInt8()
+            msg.data = 0
+            self._arm_mode_pub.publish(msg)
+            return
+        req = SetSystemControlMode.Request()
+        req.mode = ROBOT_CONTROL_OWNER
+        req.robot_control_mask = ROBOT_CONTROL_MASK_JOINT
+        req.enable_leg_control = False
+        req.enable_waist_control = False
+        if not self._control_mode_client.wait_for_service(timeout_sec=2.0):
+            raise TimeoutError("service unavailable: /robot_system_manager/set_mode")
+        future = self._control_mode_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=10.0)
+        if not future.done() or future.result() is None:
+            raise RuntimeError("/robot_system_manager/set_mode returned no result")
+        result = future.result()
+        if not bool(getattr(result, "success", False)):
+            raise RuntimeError(f"failed to set control mode mask={ROBOT_CONTROL_MASK_JOINT}: {getattr(result, 'message', '')}")
 
     def publish_axis_target(
         self,
@@ -190,7 +222,7 @@ def play_model(
     node = JointStateHold()
     try:
         current = node.wait_for_current()
-        node.set_position_mode()
+        node.set_joint_control_mode()
         left_hold = np.array([current[name] for name in LEFT_ARM_JOINTS], dtype=float)
         right_hold = np.array([current[name] for name in RIGHT_ARM_JOINTS], dtype=float)
         active_start = left_hold if arm == "left" else right_hold
