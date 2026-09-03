@@ -466,6 +466,7 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         self.both_pregrasp_btn = QtWidgets.QPushButton("双手预抓取")
         self.both_arm_z_up_btn = QtWidgets.QPushButton("双手 Z 轴上移 5cm")
         self.both_arm_z_down_btn = QtWidgets.QPushButton("双手 Z 轴下移 5cm")
+        self.place_box_btn = QtWidgets.QPushButton("放箱子（高度400后双手下移10cm）")
         self.both_lift_btn = QtWidgets.QPushButton("腰部上升 10cm")
         self.both_lower_btn = QtWidgets.QPushButton("腰部下降 10cm")
         self.generate_btn.clicked.connect(self.generate)
@@ -479,6 +480,7 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         self.both_pregrasp_btn.clicked.connect(lambda: self.send_box_both_targets("pregrasp"))
         self.both_arm_z_up_btn.clicked.connect(lambda: self.send_both_arm_z_offset(BOX_ARM_Z_STEP_M))
         self.both_arm_z_down_btn.clicked.connect(lambda: self.send_both_arm_z_offset(-BOX_ARM_Z_STEP_M))
+        self.place_box_btn.clicked.connect(self._host._run_box_place_sequence)
         self.both_lift_btn.clicked.connect(lambda: self.send_leg_lift(BOX_LIFT_DISTANCE_M))
         self.both_lower_btn.clicked.connect(lambda: self.send_leg_lift(-BOX_LIFT_DISTANCE_M))
 
@@ -491,6 +493,7 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         controls.addWidget(self.left_pregrasp_btn, 4, 0); controls.addWidget(self.left_forward_btn, 4, 1); controls.addWidget(self.right_pregrasp_btn, 4, 2); controls.addWidget(self.right_forward_btn, 4, 3)
         controls.addWidget(self.both_pregrasp_btn, 5, 0, 1, 2)
         controls.addWidget(self.both_arm_z_up_btn, 6, 0); controls.addWidget(self.both_arm_z_down_btn, 6, 1)
+        controls.addWidget(self.place_box_btn, 6, 2, 1, 2)
         controls.addWidget(self.both_lift_btn, 7, 0, 1, 2); controls.addWidget(self.both_lower_btn, 7, 2, 1, 2)
         layout.addWidget(control_box)
 

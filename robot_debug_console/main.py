@@ -47,7 +47,12 @@ RIGHT_ARM_JOINTS = ARM_JOINTS[7:]
 LEG_JOINTS = ("ankle_joint", "knee_joint", "hip_pitch_joint", "hip_yaw_joint")
 LEG_POWER_READY = 39
 RIGHT_HAND_GRASP_LABELS = {"guazi", "pai", "cui"}
-RIGHT_HAND_TCP_Y_OFFSET_M = -0.06
+# 右手侧向抓取物体的 TCP 局部 Y 偏移（单位：m），按视觉标签区分。
+RIGHT_HAND_TCP_Y_OFFSETS_M = {
+    "guazi": -0.06,
+    "cui": -0.06,
+    "pai": -0.04,
+}
 RIGHT_HAND_PREGRASP_DISTANCE_M = 0.10
 RECORD_IDLE_SECONDS = 2.0
 JOINT_IDLE_EPS_RAD = math.radians(0.2)
@@ -1321,12 +1326,14 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self.leg_joint_btn = QtWidgets.QPushButton("发腿关节")
         self.first_layer_btn = QtWidgets.QPushButton("第一层高度")
         self.second_layer_btn = QtWidgets.QPushButton("第二层高度")
+        self.second_layer_grasp_btn = QtWidgets.QPushButton("第二层抓取姿态")
         self.arm_joint_btn.clicked.connect(self._send_arm_joint)
         self.arm_cart_btn.clicked.connect(self._send_arm_cartesian)
         self.arm_cart_rel_btn.clicked.connect(self._send_arm_cartesian_relative)
         self.leg_joint_btn.clicked.connect(self._send_leg_joint)
         self.first_layer_btn.clicked.connect(self._send_first_layer_height)
         self.second_layer_btn.clicked.connect(self._send_second_layer_height)
+        self.second_layer_grasp_btn.clicked.connect(self._send_second_layer_grasp_pose)
         buttons = QtWidgets.QHBoxLayout()
         buttons.addWidget(self.arm_joint_btn)
         buttons.addWidget(self.arm_cart_btn)
@@ -1334,6 +1341,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         buttons.addWidget(self.leg_joint_btn)
         buttons.addWidget(self.first_layer_btn)
         buttons.addWidget(self.second_layer_btn)
+        buttons.addWidget(self.second_layer_grasp_btn)
         buttons.addStretch(1)
         grid.addLayout(buttons, 7, 1)
         layout.addLayout(grid)
@@ -2083,12 +2091,18 @@ class DmpMainWindow(QtWidgets.QMainWindow):
                 raise ValueError("目标有效三维点太少")
 
             self._grasp_target_arm = arm
+            class_name = str(target.get("class_name", "")).strip().lower()
+            side_offset_m = (
+                RIGHT_HAND_TCP_Y_OFFSETS_M.get(class_name, 0.0)
+                if arm == "right"
+                else 0.0
+            )
             # 左右手使用完全相同的抓取计算：目标点、水平接近向量和 TCP +X 都一致。
             self._generate_bottle_grasp_pose(
                 target,
                 points_car,
                 current_tcp,
-                side_offset_m=RIGHT_HAND_TCP_Y_OFFSET_M if arm == "right" else 0.0,
+                side_offset_m=side_offset_m,
             )
         except Exception as exc:
             self._grasp_target = None
@@ -3503,6 +3517,53 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         values = (0.0, 0.0, 0.0, 0.0)
         self._backend.send("leg_joint", values=values, vel=0.08, acc=0.20)
         self.append_log("[CMD] second layer height -> 0 0 0 0")
+
+    def _send_second_layer_grasp_pose(self) -> None:
+        """发送用户指定的第二层双臂抓取关节姿态。"""
+        left_deg = (16.0, 27.1, -28.8, -110.0, -30.9, -17.8, 9.8)
+        right_deg = (-16.7, -29.5, 23.3, 109.8, 34.4, 24.9, -3.2)
+        left = tuple(math.radians(value) for value in left_deg)
+        right = tuple(math.radians(value) for value in right_deg)
+        self._backend.send("arm_joint", left=left, right=right, vel=0.30, acc=0.50)
+        self.append_log(
+            "[CMD] second layer grasp pose -> "
+            "left +16.0 +27.1 -28.8 -110.0 -30.9 -17.8 +9.8 | "
+            "right -16.7 -29.5 +23.3 +109.8 +34.4 +24.9 -3.2"
+        )
+
+    def _run_box_place_sequence(self) -> None:
+        """放箱子：先将腰部高度调到 0.400 m，再让双臂沿 TCP Z 轴下降 10 cm。"""
+        try:
+            snap = self._backend.snapshot()
+            pose = snap.leg_pose()
+            if not pose:
+                raise ValueError("当前腿部状态还没读全，无法放箱子")
+            delta = 0.400 - float(pose["y"])
+            self._backend.send("leg_lift", delta=delta, waist_delta=0.0, vel=0.12)
+            self.append_log(f"[BOX] 放箱子第1步：腰部高度调整到 0.400m，delta={delta:+.3f}m，vel=0.12")
+            self._box_place_pending_timer = getattr(self, "_box_place_pending_timer", None)
+            if self._box_place_pending_timer is not None:
+                self._box_place_pending_timer.stop()
+                self._box_place_pending_timer.deleteLater()
+            timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._finish_box_place_sequence)
+            timer.start(3000)
+            self._box_place_pending_timer = timer
+            self.append_log("[BOX] 腰部动作发送后等待 3 秒，再执行双手 TCP Z 轴 -10cm")
+        except Exception as exc:
+            self.append_log(f"[BOX] 放箱子失败: {exc}")
+
+    def _finish_box_place_sequence(self) -> None:
+        self._box_place_pending_timer = None
+        try:
+            snap = self._backend.snapshot()
+            left = self._offset_pose_local(self._pose_xyzrpy(snap.left_ee, "左臂 TCP"), 0.0, 0.0, -0.10)
+            right = self._offset_pose_local(self._pose_xyzrpy(snap.right_ee, "右臂 TCP"), 0.0, 0.0, -0.10)
+            self._backend.send("arm_cartesian", left=left, right=right, vel=0.05, acc=0.10)
+            self.append_log("[BOX] 放箱子第2步：双手沿 TCP Z 轴下降 10cm 已发送")
+        except Exception as exc:
+            self.append_log(f"[BOX] 双手 Z 轴下降失败: {exc}")
 
     def _send_reset_arms(self) -> None:
         snap = self._backend.snapshot()
