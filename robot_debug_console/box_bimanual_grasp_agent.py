@@ -20,7 +20,7 @@ BOX_CLASS_ALIASES = {"box", "xiangzi", "carton", "crate", "boxy"}
 BOX_READY_LEFT_ARM_DEG = (15.8, 22.5, -24.7, -106.5, -27.0, -13.5, 5.6)
 BOX_READY_RIGHT_ARM_DEG = (-15.6, -18.7, 19.1, 110.0, 25.0, 14.0, -14.7)
 BOX_READY_LAYER2_LEFT_ARM_DEG = (8.6, 28.6, -29.2, -110.0, -35.6, -14.2, 22.2)
-BOX_READY_LAYER2_RIGHT_ARM_DEG = (-14.2, -20.6, 29.6, 117.2, 33.9, 14.2, -16.7)
+BOX_READY_LAYER2_RIGHT_ARM_DEG = (-14.2, -20.6, 29.6, 110.2, 33.9, 14.2, -16.7)
 BOX_DEXTEROUS_READY_RIGHT_ARM_DEG = (100.0, 0.0, 255.0, 255.0, 255.0, 255.0, 255.0)
 LEFT_ARM_JOINTS = ("ljoint1", "ljoint2", "ljoint3", "ljoint4", "ljoint5", "ljoint6", "ljoint7")
 RIGHT_ARM_JOINTS = ("rjoint1", "rjoint2", "rjoint3", "rjoint4", "rjoint5", "rjoint6", "rjoint7")
@@ -30,10 +30,10 @@ BOX_LEFT_PREGRASP_DISTANCE_M = 0.07 #左手的预备抓取距离
 BOX_RIGHT_PREGRASP_DISTANCE_M = 0.05 #右手的预备抓取距离
 BOX_LEFT_FORWARD_DISTANCE_M = 0.11
 BOX_RIGHT_FORWARD_DISTANCE_M = 0.11
-BOX_LEFT_PREGRASP_X_OFFSET_M = -0.04
+BOX_LEFT_PREGRASP_X_OFFSET_M = -0.05
 BOX_RIGHT_PREGRASP_X_OFFSET_M = 0.03
 BOX_LEFT_GRASP_Z_OFFSET_M = 0.03
-BOX_RIGHT_GRASP_Z_OFFSET_M = -0.01
+BOX_RIGHT_GRASP_Z_OFFSET_M = 0.0
 BOX_HAND_POSE = (100, 0, 255, 255, 255, 255, 255)
 BOX_LIFT_DISTANCE_M = 0.10
 BOX_ARM_Z_STEP_M = 0.05
@@ -466,6 +466,8 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         self.both_pregrasp_btn = QtWidgets.QPushButton("双手预抓取")
         self.both_arm_z_up_btn = QtWidgets.QPushButton("双手 Z 轴上移 5cm")
         self.both_arm_z_down_btn = QtWidgets.QPushButton("双手 Z 轴下移 5cm")
+        self.both_hands_open_btn = QtWidgets.QPushButton("左右手同步打开")
+        self.both_hands_close_btn = QtWidgets.QPushButton("左右手同步闭合")
         self.place_box_btn = QtWidgets.QPushButton("放箱子（高度400后双手下移10cm）")
         self.both_lift_btn = QtWidgets.QPushButton("腰部上升 10cm")
         self.both_lower_btn = QtWidgets.QPushButton("腰部下降 10cm")
@@ -480,6 +482,8 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         self.both_pregrasp_btn.clicked.connect(lambda: self.send_box_both_targets("pregrasp"))
         self.both_arm_z_up_btn.clicked.connect(lambda: self.send_both_arm_z_offset(BOX_ARM_Z_STEP_M))
         self.both_arm_z_down_btn.clicked.connect(lambda: self.send_both_arm_z_offset(-BOX_ARM_Z_STEP_M))
+        self.both_hands_open_btn.clicked.connect(lambda: self.send_both_hands_action("open"))
+        self.both_hands_close_btn.clicked.connect(lambda: self.send_both_hands_action("close"))
         self.place_box_btn.clicked.connect(self._host._run_box_place_sequence)
         self.both_lift_btn.clicked.connect(lambda: self.send_leg_lift(BOX_LIFT_DISTANCE_M))
         self.both_lower_btn.clicked.connect(lambda: self.send_leg_lift(-BOX_LIFT_DISTANCE_M))
@@ -493,8 +497,9 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
         controls.addWidget(self.left_pregrasp_btn, 4, 0); controls.addWidget(self.left_forward_btn, 4, 1); controls.addWidget(self.right_pregrasp_btn, 4, 2); controls.addWidget(self.right_forward_btn, 4, 3)
         controls.addWidget(self.both_pregrasp_btn, 5, 0, 1, 2)
         controls.addWidget(self.both_arm_z_up_btn, 6, 0); controls.addWidget(self.both_arm_z_down_btn, 6, 1)
-        controls.addWidget(self.place_box_btn, 6, 2, 1, 2)
-        controls.addWidget(self.both_lift_btn, 7, 0, 1, 2); controls.addWidget(self.both_lower_btn, 7, 2, 1, 2)
+        controls.addWidget(self.both_hands_open_btn, 6, 2); controls.addWidget(self.both_hands_close_btn, 6, 3)
+        controls.addWidget(self.place_box_btn, 7, 0, 1, 4)
+        controls.addWidget(self.both_lift_btn, 8, 0, 1, 2); controls.addWidget(self.both_lower_btn, 8, 2, 1, 2)
         layout.addWidget(control_box)
 
         self.result_label = QtWidgets.QLabel("请先在 YOLO 页识别 box / xiangzi")
@@ -533,6 +538,17 @@ class BoxBimanualGraspPanel(QtWidgets.QWidget):
             self.result_label.setText(text); self._append_log("[BOX] " + text)
         except Exception as exc:
             self.result_label.setText(f"灵巧手姿势发送失败: {exc}"); self._append_log(f"[BOX] 灵巧手姿势发送失败: {exc}")
+
+    def send_both_hands_action(self, action: str) -> None:
+        """同步启动左手夹爪与右手灵巧手的打开/闭合动作。"""
+        try:
+            self._host._run_both_hands(action)
+            text = f"左右手同步{'打开' if action == 'open' else '闭合'}已发送"
+            self.result_label.setText(text)
+            self._append_log("[BOX] " + text)
+        except Exception as exc:
+            self.result_label.setText(f"左右手同步动作失败: {exc}")
+            self._append_log(f"[BOX] 左右手同步动作失败: {exc}")
 
     def send_dexterous_ready_pose(self) -> None:
         """保留旧版灵巧收位置接口，供已有外部调用使用。"""

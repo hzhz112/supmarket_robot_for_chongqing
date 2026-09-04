@@ -12,6 +12,24 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 from robot_debug_console.main import RobotBackend, LEFT_ARM_JOINTS, RIGHT_ARM_JOINTS, LEG_JOINTS
+from robot_debug_console.box_bimanual_grasp_agent import (
+    BOX_LEFT_GRASP_Z_OFFSET_M,
+    BOX_LEFT_PREGRASP_DISTANCE_M,
+    BOX_LEFT_PREGRASP_X_OFFSET_M,
+    BOX_LIFT_DISTANCE_M,
+    BOX_ARM_Z_STEP_M,
+    BOX_RIGHT_GRASP_Z_OFFSET_M,
+    BOX_RIGHT_PREGRASP_DISTANCE_M,
+    BOX_RIGHT_PREGRASP_X_OFFSET_M,
+    BOX_HAND_POSE,
+    BOX_FRONT_PLANE_THRESHOLD_M,
+    BOX_HEIGHT_M,
+    BOX_LENGTH_M,
+    BOX_WIDTH_M,
+    generate_side_grasp_candidates,
+    estimate_box_frame,
+    estimate_front_plane,
+)
 
 RESET_L = tuple(math.radians(x) for x in (17.7, 22.5, -6.6, -106.8, -18.6, -17.1, 0.0))
 RESET_R = tuple(math.radians(x) for x in (-18.8, -29.5, 9.6, 103.0, 23.9, 19.3, -4.0))
@@ -19,12 +37,17 @@ SECOND_L = tuple(math.radians(x) for x in (13.0, 22.2, -27.0, -110.0, -35.2, -19
 SECOND_R = tuple(math.radians(x) for x in (-16.7, -29.5, 23.3, 109.8, 34.4, 24.9, -3.2))
 LAYER_FL = tuple(math.radians(x) for x in (50.6, -103.1, 52.6, 0.0))
 LAYER_SL = (0.0, 0.0, 0.0, 0.0)
+RIGHT_HAND_PREGRASP_Y_OFFSET_M = -0.03
+RIGHT_HAND_TCP_Y_OFFSETS_M = {"guazi": -0.06, "cui": -0.06, "pai": -0.04}
 
 class RetailVision:
     """迁移自旧控制台的 YOLO-seg + 深度/外参目标点计算。"""
     def __init__(self, state: Any, backend: RobotBackend, log: Callable[[str], None]):
         self.state, self.backend, self.log = state, backend, log
         self.model = None
+        self._models: dict[str, Any] = {}
+        self.last_points_car = None
+        self.last_camera_pos_car = None
         self.extrinsic = None
         path = PROJECT_ROOT / "config" / "realsense_347522072040_extrin.yaml"
         if path.exists():
@@ -33,14 +56,17 @@ class RetailVision:
             matrix = np.asarray(data.get("extrinsic_matrix", []), dtype=float)
             if matrix.shape == (4, 4): self.extrinsic = matrix
 
-    def detect(self, label: str) -> tuple[float, float, float]:
+    def detect(self, label: str, model_path: Path | None = None) -> tuple[float, float, float]:
         import cv2, numpy as np
         image, depth, intr = self.state._camera_color_image, self.state._camera_depth_m, self.state._camera_intrinsics
         if image is None or depth is None or intr is None: raise RuntimeError("相机尚未就绪")
         from ultralytics import YOLO
-        model_path = PROJECT_ROOT / "weight" / "best.pt"
+        model_path = model_path or (PROJECT_ROOT / "weight" / "best.pt")
         if not model_path.exists(): raise RuntimeError(f"视觉模型不存在: {model_path}")
-        if self.model is None: self.model = YOLO(str(model_path)); self.log(f"[VISION] 已加载模型: {model_path}")
+        model_key = str(model_path)
+        if model_key not in self._models:
+            self._models[model_key] = YOLO(model_key); self.log(f"[VISION] 已加载模型: {model_path}")
+        self.model = self._models[model_key]
         names = {str(v).lower(): int(k) for k,v in self.model.names.items()}
         if label not in names: raise RuntimeError(f"模型中没有标签: {label}")
         result = self.model.predict(image, conf=.25, iou=.45, device="cpu", classes=[names[label]], verbose=False)[0]
@@ -57,11 +83,19 @@ class RetailVision:
         if self.extrinsic is not None:
             pts=(self.extrinsic @ np.column_stack((pts,np.ones(len(pts)))).T).T[:,:3]
             tf=self.backend.snapshot().car_from_body
-            if tf is not None: pts=(np.asarray(tf) @ np.column_stack((pts,np.ones(len(pts)))).T).T[:,:3]
+            if tf is not None:
+                pts=(np.asarray(tf) @ np.column_stack((pts,np.ones(len(pts)))).T).T[:,:3]
+                camera_pos_car = (np.asarray(tf) @ np.array([self.extrinsic[0,3], self.extrinsic[1,3], self.extrinsic[2,3], 1.0])).reshape(4)[:3]
+            else:
+                camera_pos_car = None
+        else:
+            camera_pos_car = None
         # 与旧 _generate_bottle_grasp_pose 一致：Z 取 2%~98% 范围的中上部(45%)，XY 取中位数。
         z_min, z_max = float(np.percentile(pts[:,2], 2)), float(np.percentile(pts[:,2], 98))
         if z_max - z_min < .05: raise RuntimeError(f"估计目标高度异常: {z_max-z_min:.3f} m")
         p=np.array([float(np.median(pts[:,0])), float(np.median(pts[:,1])), z_min + .45*(z_max-z_min)])
+        self.last_points_car = pts.copy()
+        self.last_camera_pos_car = None if camera_pos_car is None else camera_pos_car.copy()
         self.log(f"[VISION] {label} car_link XYZ={p[0]:+.4f},{p[1]:+.4f},{p[2]:+.4f}，有效点={len(pts)}")
         return tuple(float(x) for x in p)
 
@@ -254,14 +288,23 @@ class DirectRightGrasp(DirectLeftGrasp):
 
     def _wait_right_tcp(self, target: tuple[float, ...], timeout: float = 45.0) -> None:
         deadline = time.monotonic() + timeout
+        last_log = 0.0
         while time.monotonic() < deadline:
             if self.cancelled: raise RuntimeError("任务已停止")
             cur = self.pose(self.backend.snapshot().right_ee)
             pos = math.sqrt(sum((cur[i] - target[i]) ** 2 for i in range(3)))
             rot = max(abs(cur[i] - target[i]) for i in range(3, 6))
             if pos <= .01 and rot <= math.radians(1.0): return
+            now = time.monotonic()
+            if now - last_log >= 1.0:
+                self.log(f"等待右 TCP 到位：位置误差={pos * 1000:.1f}mm，姿态误差={math.degrees(rot):.2f}deg")
+                last_log = now
             time.sleep(1.0)
-        raise TimeoutError(f"右 TCP 到位超时：目标={target[:3]}")
+        cur = self.pose(self.backend.snapshot().right_ee)
+        raise TimeoutError(
+            f"右 TCP 到位超时：目标={target[:3]}，当前={cur[:3]}，"
+            f"位置误差={math.sqrt(sum((cur[i] - target[i]) ** 2 for i in range(3))) * 1000:.1f}mm"
+        )
 
     def run(self, item: dict[str, Any], target_provider: Callable[[str], tuple[float,float,float]], max_step: int = 10) -> None:
         max_step = max(1, min(10, int(max_step))); label = str(item["label"]).lower(); special = label in self.SPECIAL
@@ -279,11 +322,13 @@ class DirectRightGrasp(DirectLeftGrasp):
         gx,gy,gz = target_provider(label); self.log(f"[4/10] 视觉目标 {gx:.3f},{gy:.3f},{gz:.3f}")
         if max_step == 4: self.log("测试模式：已到第 4 步，流程暂停"); return
         snap = self.backend.snapshot(); cur = self.pose(snap.right_ee)
-        if special: pre = (gx, gy - .10, gz, 0.0, 0.0, 0.0)
+        if special:
+            side_offset = RIGHT_HAND_TCP_Y_OFFSETS_M[label]
+            pre = (gx, gy - .10 + side_offset, gz, 0.0, 0.0, 0.0)
         else:
             dx,dy=gx-cur[0],gy-cur[1]; norm=math.hypot(dx,dy)
             if norm < 1e-4: raise RuntimeError("右 TCP 与目标水平距离过小")
-            ux,uy=dx/norm,dy/norm; pre=(gx-.08*ux, gy-.08*uy-.02, gz, 0.0, 0.0, math.atan2(uy,ux))
+            ux,uy=dx/norm,dy/norm; pre=(gx-.08*ux, gy-.08*uy+RIGHT_HAND_PREGRASP_Y_OFFSET_M, gz, 0.0, 0.0, math.atan2(uy,ux))
         left=self.pose(snap.left_ee); self.backend.send("arm_cartesian", left=left, right=pre, vel=.70, acc=.10); self._wait_right_tcp(pre); self.log("[5/10] 右手预抓取姿态到达")
         if max_step == 5: self.log("测试模式：已到第 5 步，流程暂停"); return
         cur=self.pose(self.backend.snapshot().right_ee)
@@ -302,3 +347,73 @@ class DirectRightGrasp(DirectLeftGrasp):
         if len(wt)!=4: raise RuntimeError("腿部四个关节状态不完整")
         wt["hip_yaw_joint"]=0.0; self.backend.send("leg_joint", values=tuple(wt[n] for n in LEG_JOINTS), vel=1.0, acc=.20); self.wait_joints(wt)
         self.backend.send("arm_joint", left=arm_left, right=arm_right, vel=.70, acc=.50); self.wait_joints({f"ljoint{i}":arm_left[i-1] for i in range(1,8)} | {f"rjoint{i}":arm_right[i-1] for i in range(1,8)}); self.log("[10/10] 腰部复位并完成右臂复位，任务结束")
+
+
+class BoxGrasp(DirectLeftGrasp):
+    """网页箱子双手抓取流程；放置动作暂留在网页接口中。"""
+    BOX_MODEL = PROJECT_ROOT / "weight" / "best_xiangzi.pt"
+    READY_L = tuple(math.radians(x) for x in (15.8, 22.5, -24.7, -106.5, -27.0, -13.5, 5.6))
+    READY_R = tuple(math.radians(x) for x in (-15.6, -18.7, 19.1, 110.0, 25.0, 14.0, -14.7))
+    READY2_L = tuple(math.radians(x) for x in (8.6, 28.6, -29.2, -110.0, -35.6, -14.2, 22.2))
+    # 第二层右臂第 4 关节的机械/控制实际可达位置约为 110°。
+    # 原来的 117.2° 会导致该关节长期保留约 7.2° 误差，BoxGrasp
+    # 在 wait_joints() 中一直无法通过；第一层对应值本来就是 110°。
+    READY2_R = tuple(math.radians(x) for x in (-14.2, -20.6, 29.6, 110.2, 33.9, 14.2, -16.7))
+    def __init__(self, backend, log, left_gripper, right_gripper, right_pose):
+        super().__init__(backend, log, left_gripper); self.right_gripper = right_gripper; self.right_pose = right_pose
+    def run(self, layer: str, target_provider: Callable, max_step: int = 8) -> None:
+        max_step = max(1, min(8, int(max_step))); layer = str(layer).upper()
+        self.cancelled = False; self.log(f"[BOX] 开始{('第二' if layer == 'SL' else '第一')}层箱子抓取")
+        self.gripper("open"); self.right_pose(BOX_HAND_POSE); self.log("[BOX 1/8] 左手打开，右手设置灵巧手姿态");
+        if max_step == 1: return
+        snap = self.backend.snapshot(); left_j, right_j = (self.READY2_L, self.READY2_R) if layer == "SL" else (self.READY_L, self.READY_R)
+        self.backend.send("arm_joint", left=left_j, right=right_j, vel=.40, acc=.10); self.wait_joints({f"ljoint{i}": left_j[i-1] for i in range(1,8)} | {f"rjoint{i}": right_j[i-1] for i in range(1,8)}); self.log("[BOX 2/8] 箱子初始姿态完成")
+        if max_step == 2: return
+        values = LAYER_SL if layer == "SL" else LAYER_FL; self.backend.send("leg_joint", values=values, vel=.12, acc=.20); self.wait_joints({n: values[i] for i,n in enumerate(LEG_JOINTS)}); self.log("[BOX 3/8] 升降机高度完成")
+        if max_step == 3: return
+        gx, gy, gz = target_provider("xiangzi", self.BOX_MODEL); self.log(f"[BOX 4/8] 箱体识别位置 {gx:.3f},{gy:.3f},{gz:.3f}")
+        if max_step == 4: return
+        left = self.pose(self.backend.snapshot().left_ee); right = self.pose(self.backend.snapshot().right_ee)
+        vision = getattr(target_provider, "__self__", None)
+        points_car = getattr(vision, "last_points_car", None)
+        camera_pos_car = getattr(vision, "last_camera_pos_car", None)
+        if points_car is None or camera_pos_car is None:
+            raise RuntimeError("未获取箱体点云，无法按 grasp box 算法生成预抓取姿态")
+        front, normal, _ = estimate_front_plane(points_car, preferred_face_span_m=BOX_LENGTH_M, preferred_height_m=BOX_HEIGHT_M, distance_threshold=BOX_FRONT_PLANE_THRESHOLD_M)
+        T, debug = estimate_box_frame(front, normal, camera_pos_car, box_length_m=BOX_LENGTH_M, box_width_m=BOX_WIDTH_M, box_height_m=BOX_HEIGHT_M)
+        candidates = generate_side_grasp_candidates(T, face_span_m=float(debug["face_span_m"]), box_depth_m=float(debug["box_depth_m"]), pregrasp_dist_m=BOX_LEFT_PREGRASP_DISTANCE_M, grasp_z_offset_m=BOX_LEFT_GRASP_Z_OFFSET_M, grasp_x_offset_m=BOX_LEFT_PREGRASP_X_OFFSET_M, front_center_base=debug["front_center_base"], box_center_base=debug["box_center_base"])
+        right_candidate = generate_side_grasp_candidates(T, face_span_m=float(debug["face_span_m"]), box_depth_m=float(debug["box_depth_m"]), pregrasp_dist_m=BOX_RIGHT_PREGRASP_DISTANCE_M, grasp_z_offset_m=BOX_RIGHT_GRASP_Z_OFFSET_M, grasp_x_offset_m=BOX_RIGHT_PREGRASP_X_OFFSET_M, front_center_base=debug["front_center_base"], box_center_base=debug["box_center_base"])["right"]
+        left_pre = tuple(float(v) for v in candidates["left"]["pose_pregrasp_base"])
+        right_pre = tuple(float(v) for v in right_candidate["pose_pregrasp_base"])
+        # 双手前往预抓取位置：降低速度和加速度，避免接近箱体时动作过快。
+        self.backend.send("arm_cartesian", left=left_pre, right=right_pre, vel=.30, acc=.08); self.wait_left_tcp(left_pre); self._wait_right_tcp_box(right_pre); self.log("[BOX 5/8] 双手预抓取完成")
+        if max_step == 5: return
+        # 与主界面“右手前进”一致：从右手预抓取位姿只沿基座 X 轴前进，
+        # 保持 Y/Z 和末端姿态不变，避免误沿箱体侧向 Y 轴移动。
+        right_final = (right_pre[0] + .11, right_pre[1], right_pre[2], *right_pre[3:])
+        self.backend.send("arm_cartesian", left=left_pre, right=right_final, vel=.70, acc=.10); self._wait_right_tcp_box(right_final); self.log("[BOX 6/8] 右手沿 X 轴单独前进 11cm 完成")
+        if max_step == 6: return
+        self.gripper("close"); self.right_gripper("close"); self.log("[BOX 7/8] 左右手同步闭合完成")
+        if max_step == 7: return
+        if layer == "SL":
+            left_now = self.pose(self.backend.snapshot().left_ee)
+            right_now = self.pose(self.backend.snapshot().right_ee)
+            left_up = (left_now[0], left_now[1], left_now[2] + BOX_ARM_Z_STEP_M, *left_now[3:])
+            right_up = (right_now[0], right_now[1], right_now[2] + BOX_ARM_Z_STEP_M, *right_now[3:])
+            self.backend.send("arm_cartesian", left=left_up, right=right_up, vel=.70, acc=.10)
+            self.wait_left_tcp(left_up); self._wait_right_tcp_box(right_up)
+            self.log("[BOX 8/8] 第二层双手基座 Z 轴上移 5cm 完成")
+        else:
+            if not self.backend.snapshot().leg_pose():
+                raise RuntimeError("当前腰部状态还没读全，无法执行第一层腰部上升")
+            self.backend.send("leg_lift", delta=BOX_LIFT_DISTANCE_M, waist_delta=0.0, vel=.08)
+            self.wait(arm=False, leg=True)
+            self.log("[BOX 8/8] 第一层腰部上升 10cm 完成")
+    def _wait_right_tcp_box(self, target, timeout=45.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.cancelled: raise RuntimeError("任务已停止")
+            cur = self.pose(self.backend.snapshot().right_ee)
+            if math.sqrt(sum((cur[i]-target[i])**2 for i in range(3))) <= .01: return
+            time.sleep(.2)
+        raise TimeoutError(f"右 TCP 到位超时：目标={target[:3]}")

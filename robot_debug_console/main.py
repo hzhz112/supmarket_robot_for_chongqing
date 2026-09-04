@@ -1750,6 +1750,8 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         return page
 
     def _start_final_grasp_process(self, command: list[str], message: str) -> None:
+        if getattr(self, "_sync_hand_processes", None):
+            raise ValueError("左右手同步动作正在运行")
         if self._grasp_process is not None and self._grasp_process.state() != QtCore.QProcess.NotRunning:
             raise ValueError("已有最终抓取任务在运行")
         self.append_log(message)
@@ -1771,6 +1773,56 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         self._grasp_process = process
         self._set_final_grasp_busy(True)
 
+    def _run_both_hands(self, action: str) -> None:
+        """同时启动左手夹爪和右手灵巧手的打开/闭合命令。"""
+        if action not in {"open", "close"}:
+            raise ValueError("同步动作必须是 open 或 close")
+        if self._grasp_process is not None and self._grasp_process.state() != QtCore.QProcess.NotRunning:
+            raise ValueError("已有最终抓取任务在运行")
+        if getattr(self, "_sync_hand_processes", None):
+            raise ValueError("左右手同步动作正在运行")
+        left_port = self.final_gripper_port_input.text().strip() or LEFT_GRIPPER_PORT
+        right_port = self.final_o7_port_input.text().strip() or O7_RS485_PORT
+        left_command = [sys.executable, "-u", str(LEFT_GRIPPER_SCRIPT), "--port", left_port, f"--{action}-once"]
+        right_command = [
+            sys.executable, "-u", str(O7_RS485_SCRIPT), "--port", right_port,
+            "--hand_type", "right", "--once", "--preset", "fist" if action == "close" else "open",
+            "--no-open-on-exit",
+        ]
+        processes: list[QtCore.QProcess] = []
+        self._sync_hand_processes = processes
+        self.append_log(f"[GRASP] 左右手同步{'闭合' if action == 'close' else '打开'}: left={left_port}, right={right_port}")
+        for command, label in ((left_command, "左手"), (right_command, "右手")):
+            process = QtCore.QProcess(self)
+            process.setProgram(command[0]); process.setArguments(command[1:])
+            process.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+            process.readyReadStandardOutput.connect(
+                lambda p=process, name=label: self.append_log(
+                    f"[GRASP] {name}: " + bytes(p.readAllStandardOutput()).decode("utf-8", errors="ignore").strip()
+                )
+            )
+            process.finished.connect(lambda code, _status, p=process, name=label: self._sync_hand_finished(p, name, code))
+            process.errorOccurred.connect(lambda error, p=process, name=label: self.append_log(f"[GRASP] {name} process error={int(error)}: {p.errorString()}"))
+            process.start()
+            if not process.waitForStarted(2000):
+                process.deleteLater()
+                self._sync_hand_processes = None
+                raise RuntimeError(f"{label}同步动作启动失败")
+            processes.append(process)
+        self._set_final_grasp_busy(True)
+
+    def _sync_hand_finished(self, process: QtCore.QProcess, label: str, code: int) -> None:
+        self.append_log(f"[GRASP] {label}同步动作完成 exit={code}")
+        processes = getattr(self, "_sync_hand_processes", None)
+        if processes is None:
+            process.deleteLater(); return
+        if process in processes:
+            processes.remove(process)
+        process.deleteLater()
+        if not processes:
+            self._sync_hand_processes = None
+            self._set_final_grasp_busy(False)
+
     def _set_final_grasp_busy(self, busy: bool) -> None:
         if hasattr(self, "final_o7_close_btn"):
             self.final_o7_close_btn.setEnabled(not busy)
@@ -1784,6 +1836,11 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             self.final_right_place_btn.setEnabled(not busy)
         if hasattr(self, "final_left_place_btn"):
             self.final_left_place_btn.setEnabled(not busy)
+        if hasattr(self, "_box_grasp_page") and self._box_grasp_page is not None:
+            for name in ("both_hands_open_btn", "both_hands_close_btn"):
+                button = getattr(self._box_grasp_page, name, None)
+                if button is not None:
+                    button.setEnabled(not busy)
         if hasattr(self, "final_action_status"):
             self.final_action_status.setText("运行中..." if busy else "等待你操作灵巧手")
 
@@ -1802,6 +1859,17 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             self._set_final_grasp_busy(False)
 
     def _stop_final_grasp_process(self) -> None:
+        sync_processes = getattr(self, "_sync_hand_processes", None)
+        if sync_processes:
+            for process in list(sync_processes):
+                if process.state() != QtCore.QProcess.NotRunning:
+                    process.kill()
+                    process.waitForFinished(1500)
+                process.deleteLater()
+            self._sync_hand_processes = None
+            self._set_final_grasp_busy(False)
+            self.append_log("[GRASP] 左右手同步动作已停止")
+            return
         process = self._grasp_process
         if process is None:
             self._set_final_grasp_busy(False)
@@ -3548,7 +3616,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         )
 
     def _run_box_place_sequence(self) -> None:
-        """放箱子：先将腰部高度调到 0.400 m，再让双臂沿 TCP Z 轴下降 10 cm。"""
+        """放箱子：等待腰部实际到达 0.400 m 后，再让双臂沿 TCP Z 轴下降 10 cm。"""
         try:
             snap = self._backend.snapshot()
             pose = snap.leg_pose()
@@ -3557,18 +3625,55 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             delta = 0.400 - float(pose["y"])
             self._backend.send("leg_lift", delta=delta, waist_delta=0.0, vel=0.12)
             self.append_log(f"[BOX] 放箱子第1步：腰部高度调整到 0.400m，delta={delta:+.3f}m，vel=0.12")
-            self._box_place_pending_timer = getattr(self, "_box_place_pending_timer", None)
-            if self._box_place_pending_timer is not None:
-                self._box_place_pending_timer.stop()
-                self._box_place_pending_timer.deleteLater()
+            old_timer = getattr(self, "_box_place_pending_timer", None)
+            if old_timer is not None:
+                old_timer.stop()
+                old_timer.deleteLater()
+            self._box_place_wait_started = time.monotonic()
+            self._box_place_wait_saw_moving = False
             timer = QtCore.QTimer(self)
-            timer.setSingleShot(True)
-            timer.timeout.connect(self._finish_box_place_sequence)
-            timer.start(3000)
+            timer.setInterval(100)
+            timer.timeout.connect(self._poll_box_place_leg_motion)
+            timer.start()
             self._box_place_pending_timer = timer
-            self.append_log("[BOX] 腰部动作发送后等待 3 秒，再执行双手 TCP Z 轴 -10cm")
+            self.append_log("[BOX] 已发送腰部高度命令，等待实际到达 0.400m 后再执行双手 TCP Z 轴 -10cm")
         except Exception as exc:
             self.append_log(f"[BOX] 放箱子失败: {exc}")
+
+    def _poll_box_place_leg_motion(self) -> None:
+        """轮询腿部运动状态，确认腰部到位后才进入机械臂下降步骤。"""
+        timer = getattr(self, "_box_place_pending_timer", None)
+        try:
+            snap = self._backend.snapshot()
+            motion = snap.leg_motion
+            pose = snap.leg_pose()
+            if motion is not None:
+                is_moving, goal_reached = bool(motion[0]), bool(motion[1])
+                self._box_place_wait_saw_moving |= is_moving
+                # 控制器动作很快时可能采不到 moving；goal_reached 持续有效即可。
+                motion_done = (not is_moving) and (self._box_place_wait_saw_moving or goal_reached)
+            else:
+                motion_done = False
+            height_ok = pose is not None and abs(float(pose["y"]) - 0.400) <= 0.005
+            if motion_done and height_ok:
+                if timer is not None:
+                    timer.stop(); timer.deleteLater()
+                self._box_place_pending_timer = None
+                self.append_log(
+                    f"[BOX] 腰部已到达 0.400m（实际 {float(pose['y']):.3f}m），开始双手 TCP Z 轴下降 10cm"
+                )
+                self._finish_box_place_sequence()
+                return
+            if time.monotonic() - getattr(self, "_box_place_wait_started", time.monotonic()) > 45.0:
+                if timer is not None:
+                    timer.stop(); timer.deleteLater()
+                self._box_place_pending_timer = None
+                raise TimeoutError(f"等待腰部到达 0.400m 超时：motion={motion}, pose={pose}")
+        except Exception as exc:
+            if timer is not None:
+                timer.stop(); timer.deleteLater()
+            self._box_place_pending_timer = None
+            self.append_log(f"[BOX] 等待腰部到位失败: {exc}")
 
     def _finish_box_place_sequence(self) -> None:
         self._box_place_pending_timer = None

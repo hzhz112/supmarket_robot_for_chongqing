@@ -10,8 +10,9 @@ from typing import Any
 import yaml
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
 import uvicorn
-from retail_grasp_controller import DirectLeftGrasp, DirectRightGrasp, RetailVision
+from retail_grasp_controller import DirectLeftGrasp, DirectRightGrasp, BoxGrasp, RetailVision
 
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
@@ -21,8 +22,13 @@ RIGHT_HAND_SCRIPT = PROJECT_ROOT.parent / "linkhand" / "linker_hand_python_sdk" 
 LEFT_GRIPPER_SCRIPT = PROJECT_ROOT / "omni_picker_rs485_test.py"
 CATALOG = PROJECT_ROOT / "config" / "grasp_catalog.yaml"
 app = FastAPI(title="Retail Grasp Console")
+app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
 catalog = yaml.safe_load(CATALOG.read_text(encoding="utf-8")) or {}
 products = [x for x in catalog.get("objects", []) if not str(x.get("name", "")).startswith("箱子")]
+boxes = [
+    {"name": "第一层箱子", "label": "xiangzi", "box_layer": "FL"},
+    {"name": "第二层箱子", "label": "xiangzi", "box_layer": "SL"},
+]
 
 class CameraCapture:
     """不依赖 Qt 事件循环的 RealSense 采集线程，供网页 JPEG 和视觉识别共用。"""
@@ -61,6 +67,9 @@ class Controller:
     def __init__(self) -> None:
         self.running = False; self.logs: list[str] = []; self._thread: threading.Thread | None = None
         self.backend: Any = None; self.host: Any = None
+        self._end_effector_lock = threading.Lock()
+        self._startup_done = threading.Event()
+        self._startup_error: str | None = None
         try:
             os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
             from PyQt5 import QtWidgets
@@ -72,6 +81,7 @@ class Controller:
             self.vision = RetailVision(self.host, self.backend, self.log)
             self.grasp = DirectLeftGrasp(self.backend, self.log, lambda action: self.gripper("left", action))
             self.right_grasp = DirectRightGrasp(self.backend, self.log, lambda action: self.gripper("right", action))
+            self.box_grasp = BoxGrasp(self.backend, self.log, lambda action: self.gripper("left", action), lambda action: self.gripper("right", action), self._right_hand_pose)
             threading.Thread(target=self._startup_grippers, daemon=True).start()
         except Exception as exc:
             self.log(f"控制器初始化失败（网页仍可打开）: {exc}")
@@ -87,7 +97,10 @@ class Controller:
             self.gripper("right", "close"); time.sleep(2); self.gripper("right", "open")
             self.log("启动末端自检完成：左右末端均为张开状态")
         except Exception as exc:
+            self._startup_error = str(exc)
             self.log(f"启动末端自检失败：{exc}")
+        finally:
+            self._startup_done.set()
 
     def power(self, enable: bool) -> None:
         if not self.backend: raise RuntimeError("ROS 控制器未初始化")
@@ -97,22 +110,39 @@ class Controller:
         if action not in {"close", "open"}: raise RuntimeError("动作必须是 close 或 open")
         if hand == "left":
             port = os.environ.get("LEFT_GRIPPER_PORT", "/dev/ttyS2")
-            command = ["python3", "-u", str(LEFT_GRIPPER_SCRIPT), "--port", port, f"--{'close' if action == 'close' else 'open'}-once"]
+            command = [sys.executable, "-u", str(LEFT_GRIPPER_SCRIPT), "--port", port, f"--{'close' if action == 'close' else 'open'}-once"]
         elif hand == "right":
             port = os.environ.get("RIGHT_HAND_PORT", "/dev/ttyS3")
-            command = ["python3", "-u", str(RIGHT_HAND_SCRIPT), "--port", port, "--hand_type", "right", "--once", "--preset", "fist" if action == "close" else "open", "--no-open-on-exit"]
+            command = [sys.executable, "-u", str(RIGHT_HAND_SCRIPT), "--port", port, "--hand_type", "right", "--once", "--preset", "fist" if action == "close" else "open", "--no-open-on-exit"]
         else: raise RuntimeError("未知末端执行器")
         if hand == "left":
             self.log(f"左手夹爪{'闭合' if action == 'close' else '张开'}：开始执行（{port}）")
         try:
-            result = subprocess.run(command, cwd=str(ROOT), text=True, capture_output=True, timeout=15)
+            with self._end_effector_lock:
+                result = subprocess.run(command, cwd=str(ROOT), text=True, capture_output=True, timeout=15)
         except Exception as exc:
             raise RuntimeError(f"末端程序启动失败：{exc}") from exc
         output = (result.stdout + result.stderr).strip()
-        if hand == "left" and output:
+        if output:
             self.log(output)
-        if result.returncode != 0: raise RuntimeError(f"末端程序退出码 {result.returncode}")
+        if result.returncode != 0:
+            detail = output[-1200:] if output else "无脚本输出"
+            raise RuntimeError(f"末端程序退出码 {result.returncode}: {detail}")
         self.log(f"{'左手夹爪' if hand == 'left' else '右手灵巧手'}{'闭合' if action == 'close' else '张开'}完成")
+
+    def _right_hand_pose(self, values: tuple[int, ...]) -> None:
+        if len(values) != 7 or any(int(v) < 0 or int(v) > 255 for v in values):
+            raise ValueError(f"右手姿态必须是 7 个 0-255 整数，当前={values}")
+        port = os.environ.get("RIGHT_HAND_PORT", "/dev/ttyS3")
+        command = [sys.executable, "-u", str(RIGHT_HAND_SCRIPT), "--port", port, "--hand_type", "right", "--once", "--position", *[str(int(v)) for v in values], "--no-open-on-exit"]
+        with self._end_effector_lock:
+            result = subprocess.run(command, cwd=str(ROOT), text=True, capture_output=True, timeout=15)
+        output = (result.stdout + result.stderr).strip()
+        if output:
+            self.log(output)
+        if result.returncode != 0:
+            detail = output[-1200:] if output else "无脚本输出"
+            raise RuntimeError(f"右手姿态程序退出码 {result.returncode}: {detail}")
 
     def _wait_motion(self, arm: bool = True, leg: bool = False, timeout: float = 45.0) -> None:
         """等待 ROS motion_status：先观察到 moving，再等待停止/到达。"""
@@ -141,12 +171,20 @@ class Controller:
         self.running = False; self.log("自动抓取已停止")
         if hasattr(self, "grasp"): self.grasp.stop()
         if hasattr(self, "right_grasp"): self.right_grasp.stop()
+        if hasattr(self, "box_grasp"): self.box_grasp.stop()
 
     def _workflow(self, item: dict[str, Any], max_step: int) -> None:
         try:
             if not self.backend: raise RuntimeError("ROS 控制器未初始化")
-            runner = self.right_grasp if str(item.get("hand", "left")).lower() == "right" else self.grasp
-            runner.run(item, self.vision.detect, max_step=max_step)
+            if not self._startup_done.wait(timeout=30.0):
+                raise TimeoutError("等待启动末端自检结束超时")
+            if self._startup_error:
+                raise RuntimeError(f"启动末端自检失败，未执行任务: {self._startup_error}")
+            if item.get("box_layer"):
+                self.box_grasp.run(str(item["box_layer"]), self.vision.detect, max_step=max_step)
+            else:
+                runner = self.right_grasp if str(item.get("hand", "left")).lower() == "right" else self.grasp
+                runner.run(item, self.vision.detect, max_step=max_step)
         except Exception as exc: self.log(f"流程失败：{exc}")
         finally: self.running = False
 
@@ -157,8 +195,14 @@ def index() -> str:
     return (ROOT / "retail_grasp_web.html").read_text(encoding="utf-8")
 @app.get("/api/products")
 def get_products(): return products
+@app.get("/api/boxes")
+def get_boxes(): return boxes
 @app.get("/api/status")
 def status(): return {"running": controller.running, "logs": controller.logs}
+@app.post("/api/logs/clear")
+def clear_logs():
+    controller.logs.clear()
+    return {"ok": True}
 @app.get("/api/camera.jpg")
 def camera_jpg():
     try:
@@ -181,6 +225,8 @@ def set_power(enable: bool): controller.power(enable); return {"ok": True}
 def gripper(hand: str, action: str):
     if controller.running:
         return {"ok": False, "error": "自动抓取运行中，暂时不能手动控制末端"}
+    if not controller._startup_done.is_set():
+        return {"ok": False, "error": "启动末端自检进行中，请稍后再控制末端"}
     if hand not in {"left", "right"} or action not in {"open", "close"}:
         return {"ok": False, "error": "参数必须是 hand=left/right、action=open/close"}
     controller.log(f"手动末端操作：{hand} {action}")
@@ -188,12 +234,24 @@ def gripper(hand: str, action: str):
     return {"ok": True, "hand": hand, "action": action}
 @app.post("/api/start/{name}")
 def start(name: str, hand: str = "left", max_step: int = 11):
-    item = next((x for x in products if x.get("name") == name), None)
+    item = next((x for x in products + boxes if x.get("name") == name), None)
     if not item: return {"ok": False, "error": "商品不存在"}
     if not 1 <= max_step <= 10:
         return {"ok": False, "error": "max_step 必须是 1 到 10"}
     controller.log(f"收到调试任务：{name}，最大执行步骤={max_step}")
     controller.start(item, hand, max_step); return {"ok": True, "max_step": max_step}
+@app.post("/api/box/{layer}/{action}")
+def box_action(layer: str, action: str, max_step: int = 8):
+    if layer not in {"FL", "SL"} or action not in {"grasp", "place"}:
+        return {"ok": False, "error": "参数必须是 layer=FL/SL、action=grasp/place"}
+    if action == "place":
+        return {"ok": False, "error": "放置箱子流程暂未实现"}
+    item = next(x for x in boxes if x["box_layer"] == layer)
+    if controller.running: return {"ok": False, "error": "已有任务运行中"}
+    if not 1 <= max_step <= 8: return {"ok": False, "error": "max_step 必须是 1 到 8"}
+    controller.log(f"收到箱子抓取任务：{item['name']}，最大执行步骤={max_step}")
+    controller.start(item, "left", max_step)
+    return {"ok": True, "max_step": max_step}
 @app.post("/api/stop")
 def stop(): controller.stop(); return {"ok": True}
 @app.websocket("/ws")
@@ -202,6 +260,8 @@ async def ws(socket: WebSocket):
     while True:
         await asyncio.sleep(.3)
         logs = controller.logs
+        if len(logs) < seen:
+            seen = 0
         if len(logs) != seen: await socket.send_json({"running": controller.running, "logs": logs[seen:]}); seen = len(logs)
 
 if __name__ == "__main__":
