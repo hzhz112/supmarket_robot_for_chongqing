@@ -54,6 +54,8 @@ RIGHT_HAND_TCP_Y_OFFSETS_M = {
     "pai": -0.04,
 }
 RIGHT_HAND_PREGRASP_DISTANCE_M = 0.10
+# 通用右手预抓取点沿 car_link 全局 Y 轴偏移（单位：m）。
+RIGHT_HAND_PREGRASP_Y_OFFSET_M = -0.03
 RECORD_IDLE_SECONDS = 2.0
 JOINT_IDLE_EPS_RAD = math.radians(0.2)
 CART_IDLE_POS_EPS_M = 0.002
@@ -2118,6 +2120,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         x_axis: "np.ndarray",
         rotation: "np.ndarray",
         final_gap_m: float,
+        pregrasp_y_offset_m: float = 0.0,
     ) -> tuple[tuple[float, ...], tuple[float, ...], "np.ndarray", "np.ndarray"]:
         """按统一距离生成预抓取和接近抓取目标。"""
         import numpy as np
@@ -2131,6 +2134,8 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         x_axis = np.asarray(x_axis, dtype=np.float64)
         x_axis /= np.linalg.norm(x_axis)
         pregrasp_position = grasp_position - x_axis * pregrasp_distance
+        # 预抓取点按手臂使用全局 Y 偏移；接近目标点保持原逻辑。
+        pregrasp_position[1] += float(pregrasp_y_offset_m)
         # 第二阶段停在距离目标 final_gap_m 的位置，不直接闭合夹爪。
         forward_target_position = grasp_position - x_axis * final_gap_m
         roll, pitch, yaw = rotation_matrix_to_rpy(rotation)
@@ -2278,8 +2283,19 @@ class DmpMainWindow(QtWidgets.QMainWindow):
             self._grasp_right_side_mode = False
             self._grasp_contact_axis = x_axis.copy()
             self._grasp_pregrasp_distance_m = pregrasp_distance_m
+            pregrasp_y_offset_m = (
+                RIGHT_HAND_PREGRASP_Y_OFFSET_M
+                if self._grasp_target_arm == "right"
+                else 0.02
+            )
             self._grasp_target, self._grasp_contact_target, pregrasp_position, forward_target_position = (
-                self._make_grasp_targets(grasp_position, x_axis, rotation, final_gap_m)
+                self._make_grasp_targets(
+                    grasp_position,
+                    x_axis,
+                    rotation,
+                    final_gap_m,
+                    pregrasp_y_offset_m=pregrasp_y_offset_m,
+                )
             )
         # 左右手主抓取计算相同；右手额外沿末端局部 -Y 向右平移，
         # 用于让夹爪中心而不是手掌中心对准物体。
@@ -3520,7 +3536,7 @@ class DmpMainWindow(QtWidgets.QMainWindow):
 
     def _send_second_layer_grasp_pose(self) -> None:
         """发送用户指定的第二层双臂抓取关节姿态。"""
-        left_deg = (16.0, 27.1, -28.8, -110.0, -30.9, -17.8, 9.8)
+        left_deg = (13.0, 22.2, -27.0, -110.0, -35.2, -19.2, 18.2)
         right_deg = (-16.7, -29.5, 23.3, 109.8, 34.4, 24.9, -3.2)
         left = tuple(math.radians(value) for value in left_deg)
         right = tuple(math.radians(value) for value in right_deg)

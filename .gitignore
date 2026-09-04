@@ -16,4 +16,7 @@
 !weight/
 !weight/**
 
+# 独立零售抓取网页与控制模块。
+!retail_grasp/
+!retail_grasp/**
 

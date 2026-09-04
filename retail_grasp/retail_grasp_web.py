@@ -11,13 +11,13 @@ import yaml
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, Response
 import uvicorn
-from retail_grasp_controller import DirectLeftGrasp, RetailVision
+from retail_grasp_controller import DirectLeftGrasp, DirectRightGrasp, RetailVision
 
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-RIGHT_HAND_SCRIPT = ROOT.parent / "linkhand" / "linker_hand_python_sdk" / "example" / "o7_rs485_control.py"
+RIGHT_HAND_SCRIPT = PROJECT_ROOT.parent / "linkhand" / "linker_hand_python_sdk" / "example" / "o7_rs485_control.py"
 LEFT_GRIPPER_SCRIPT = PROJECT_ROOT / "omni_picker_rs485_test.py"
 CATALOG = PROJECT_ROOT / "config" / "grasp_catalog.yaml"
 app = FastAPI(title="Retail Grasp Console")
@@ -71,6 +71,7 @@ class Controller:
             self.camera = CameraCapture(self.host, self.log)
             self.vision = RetailVision(self.host, self.backend, self.log)
             self.grasp = DirectLeftGrasp(self.backend, self.log, lambda action: self.gripper("left", action))
+            self.right_grasp = DirectRightGrasp(self.backend, self.log, lambda action: self.gripper("right", action))
             threading.Thread(target=self._startup_grippers, daemon=True).start()
         except Exception as exc:
             self.log(f"控制器初始化失败（网页仍可打开）: {exc}")
@@ -101,13 +102,15 @@ class Controller:
             port = os.environ.get("RIGHT_HAND_PORT", "/dev/ttyS3")
             command = ["python3", "-u", str(RIGHT_HAND_SCRIPT), "--port", port, "--hand_type", "right", "--once", "--preset", "fist" if action == "close" else "open", "--no-open-on-exit"]
         else: raise RuntimeError("未知末端执行器")
-        self.log(f"{'左手夹爪' if hand == 'left' else '右手灵巧手'}{'闭合' if action == 'close' else '张开'}：开始执行（{port}）")
+        if hand == "left":
+            self.log(f"左手夹爪{'闭合' if action == 'close' else '张开'}：开始执行（{port}）")
         try:
             result = subprocess.run(command, cwd=str(ROOT), text=True, capture_output=True, timeout=15)
         except Exception as exc:
             raise RuntimeError(f"末端程序启动失败：{exc}") from exc
         output = (result.stdout + result.stderr).strip()
-        if output: self.log(output)
+        if hand == "left" and output:
+            self.log(output)
         if result.returncode != 0: raise RuntimeError(f"末端程序退出码 {result.returncode}")
         self.log(f"{'左手夹爪' if hand == 'left' else '右手灵巧手'}{'闭合' if action == 'close' else '张开'}完成")
 
@@ -132,17 +135,18 @@ class Controller:
 
     def start(self, item: dict[str, Any], hand: str = "left", max_step: int = 11) -> None:
         if self.running: raise RuntimeError("已有任务运行中")
-        if hand != "left": raise RuntimeError("右手流程尚未实现")
         self.running = True; self._thread = threading.Thread(target=self._workflow, args=(item, max_step), daemon=True); self._thread.start()
 
     def stop(self) -> None:
         self.running = False; self.log("自动抓取已停止")
         if hasattr(self, "grasp"): self.grasp.stop()
+        if hasattr(self, "right_grasp"): self.right_grasp.stop()
 
     def _workflow(self, item: dict[str, Any], max_step: int) -> None:
         try:
             if not self.backend: raise RuntimeError("ROS 控制器未初始化")
-            self.grasp.run(item, self.vision.detect, max_step=max_step)
+            runner = self.right_grasp if str(item.get("hand", "left")).lower() == "right" else self.grasp
+            runner.run(item, self.vision.detect, max_step=max_step)
         except Exception as exc: self.log(f"流程失败：{exc}")
         finally: self.running = False
 
@@ -174,11 +178,21 @@ def camera_status():
 @app.post("/api/power/{enable}")
 def set_power(enable: bool): controller.power(enable); return {"ok": True}
 @app.post("/api/gripper/{hand}/{action}")
-def gripper(hand: str, action: str): controller.gripper(hand, action); return {"ok": True}
+def gripper(hand: str, action: str):
+    if controller.running:
+        return {"ok": False, "error": "自动抓取运行中，暂时不能手动控制末端"}
+    if hand not in {"left", "right"} or action not in {"open", "close"}:
+        return {"ok": False, "error": "参数必须是 hand=left/right、action=open/close"}
+    controller.log(f"手动末端操作：{hand} {action}")
+    controller.gripper(hand, action)
+    return {"ok": True, "hand": hand, "action": action}
 @app.post("/api/start/{name}")
 def start(name: str, hand: str = "left", max_step: int = 11):
     item = next((x for x in products if x.get("name") == name), None)
     if not item: return {"ok": False, "error": "商品不存在"}
+    if not 1 <= max_step <= 10:
+        return {"ok": False, "error": "max_step 必须是 1 到 10"}
+    controller.log(f"收到调试任务：{name}，最大执行步骤={max_step}")
     controller.start(item, hand, max_step); return {"ok": True, "max_step": max_step}
 @app.post("/api/stop")
 def stop(): controller.stop(); return {"ok": True}
