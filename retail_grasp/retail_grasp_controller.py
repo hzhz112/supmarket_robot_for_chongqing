@@ -35,10 +35,22 @@ RESET_L = tuple(math.radians(x) for x in (17.7, 22.5, -6.6, -106.8, -18.6, -17.1
 RESET_R = tuple(math.radians(x) for x in (-18.8, -29.5, 9.6, 103.0, 23.9, 19.3, -4.0))
 SECOND_L = tuple(math.radians(x) for x in (13.0, 22.2, -27.0, -110.0, -35.2, -19.2, 18.2))
 SECOND_R = tuple(math.radians(x) for x in (-16.7, -29.5, 23.3, 109.8, 34.4, 24.9, -3.2))
+PLACE_LEG_065 = tuple(math.radians(x) for x in (28.1, -57.1, 29.0, 0.0))
+PLACE_XYZ = (0.40, 0.00, 1.10)
+PLACE_Z_DROP_M = 0.10
 LAYER_FL = tuple(math.radians(x) for x in (50.6, -103.1, 52.6, 0.0))
 LAYER_SL = (0.0, 0.0, 0.0, 0.0)
 RIGHT_HAND_PREGRASP_Y_OFFSET_M = -0.03
 RIGHT_HAND_TCP_Y_OFFSETS_M = {"guazi": -0.06, "cui": -0.06, "pai": -0.04}
+# 普通右手商品默认参数；特殊商品使用下方 SPECIAL_* 参数。
+RIGHT_HAND_NORMAL_PREGRASP_DISTANCE_M = 0.05
+RIGHT_HAND_NORMAL_FORWARD_DISTANCE_M = 0.07
+RIGHT_HAND_NORMAL_PREGRASP_Y_OFFSET_M = -0.05
+# 特殊商品（guazi/cui/pai）专用距离；普通右手商品保持原有参数。
+SPECIAL_RIGHT_PREGRASP_DISTANCE_M = 0.05
+SPECIAL_RIGHT_FORWARD_DISTANCE_M = 0.07
+BOX_PLACE_DROP_FIRST_LAYER_M = 0.060
+BOX_PLACE_DROP_SECOND_LAYER_M = 0.062
 
 class RetailVision:
     """迁移自旧控制台的 YOLO-seg + 深度/外参目标点计算。"""
@@ -90,7 +102,7 @@ class RetailVision:
                 camera_pos_car = None
         else:
             camera_pos_car = None
-        # 与旧 _generate_bottle_grasp_pose 一致：Z 取 2%~98% 范围的中上部(45%)，XY 取中位数。
+        # 与 main.py 通用按钮链路一致：Z 取 2%~98% 范围的中上部(45%)，XY 取中位数。
         z_min, z_max = float(np.percentile(pts[:,2], 2)), float(np.percentile(pts[:,2], 98))
         if z_max - z_min < .05: raise RuntimeError(f"估计目标高度异常: {z_max-z_min:.3f} m")
         p=np.array([float(np.median(pts[:,0])), float(np.median(pts[:,1])), z_min + .45*(z_max-z_min)])
@@ -323,25 +335,41 @@ class DirectRightGrasp(DirectLeftGrasp):
         if max_step == 4: self.log("测试模式：已到第 4 步，流程暂停"); return
         snap = self.backend.snapshot(); cur = self.pose(snap.right_ee)
         if special:
+            # 与 main.py 的实际“生成预抓取姿态”按钮一致：
+            # 先按当前 TCP 到目标的水平方向确定局部 +X，再叠加右手
+            # 全局 Y 偏移和标签对应的 TCP 局部 -Y 偏移。
             side_offset = RIGHT_HAND_TCP_Y_OFFSETS_M[label]
-            pre = (gx, gy - .10 + side_offset, gz, 0.0, 0.0, 0.0)
+            dx, dy = gx - cur[0], gy - cur[1]
+            norm = math.hypot(dx, dy)
+            if norm < 1e-4: raise RuntimeError("右 TCP 与目标水平距离过小")
+            ux, uy = dx / norm, dy / norm
+            # 特殊商品预抓取距离按当前标定要求为 5 cm，右手通用全局 Y 偏移为 -3 cm。
+            yaw = math.atan2(uy, ux)
+            pre_distance = SPECIAL_RIGHT_PREGRASP_DISTANCE_M
+            pre_x = gx - pre_distance * ux + side_offset * (-uy)
+            pre_y = gy - pre_distance * uy + RIGHT_HAND_PREGRASP_Y_OFFSET_M + side_offset * ux
+            pre = (pre_x, pre_y, gz, 0.0, 0.0, yaw)
         else:
             dx,dy=gx-cur[0],gy-cur[1]; norm=math.hypot(dx,dy)
             if norm < 1e-4: raise RuntimeError("右 TCP 与目标水平距离过小")
-            ux,uy=dx/norm,dy/norm; pre=(gx-.08*ux, gy-.08*uy+RIGHT_HAND_PREGRASP_Y_OFFSET_M, gz, 0.0, 0.0, math.atan2(uy,ux))
+            ux,uy=dx/norm,dy/norm; pre=(gx-RIGHT_HAND_NORMAL_PREGRASP_DISTANCE_M*ux, gy-RIGHT_HAND_NORMAL_PREGRASP_DISTANCE_M*uy+RIGHT_HAND_NORMAL_PREGRASP_Y_OFFSET_M, gz, 0.0, 0.0, math.atan2(uy,ux))
         left=self.pose(snap.left_ee); self.backend.send("arm_cartesian", left=left, right=pre, vel=.70, acc=.10); self._wait_right_tcp(pre); self.log("[5/10] 右手预抓取姿态到达")
         if max_step == 5: self.log("测试模式：已到第 5 步，流程暂停"); return
         cur=self.pose(self.backend.snapshot().right_ee)
-        if special: contact=(cur[0],cur[1]+.10,cur[2],*cur[3:])
+        if special:
+            # 与 main.py 的“沿当前 TCP +X 前进”按钮一致。
+            roll, pitch, yaw = cur[3:]
+            xa = (math.cos(pitch) * math.cos(yaw), math.cos(pitch) * math.sin(yaw), -math.sin(pitch))
+            contact = tuple(cur[i] + (SPECIAL_RIGHT_FORWARD_DISTANCE_M * xa[i] if i < 3 else 0.0) for i in range(6))
         else:
-            roll,pitch,yaw=cur[3:]; xa=(math.cos(pitch)*math.cos(yaw),math.cos(pitch)*math.sin(yaw),-math.sin(pitch)); contact=tuple(cur[i]+(.10*xa[i] if i<3 else 0.0) for i in range(6))
-        self.backend.send("arm_cartesian", left=left, right=contact, vel=.70, acc=.10); self._wait_right_tcp(contact); self.log("[6/10] 右手前进 10 cm 完成")
+            roll,pitch,yaw=cur[3:]; xa=(math.cos(pitch)*math.cos(yaw),math.cos(pitch)*math.sin(yaw),-math.sin(pitch)); contact=tuple(cur[i]+(RIGHT_HAND_NORMAL_FORWARD_DISTANCE_M*xa[i] if i<3 else 0.0) for i in range(6))
+        self.backend.send("arm_cartesian", left=left, right=contact, vel=.70, acc=.10); self._wait_right_tcp(contact); self.log(f"[6/10] 右手前进 {(SPECIAL_RIGHT_FORWARD_DISTANCE_M if special else RIGHT_HAND_NORMAL_FORWARD_DISTANCE_M) * 100:.0f} cm 完成")
         if max_step == 6: self.log("测试模式：已到第 6 步，流程暂停"); return
         self.gripper("close"); time.sleep(3); self.log("[7/10] 右灵巧手闭合完成")
         if max_step == 7: self.log("测试模式：已到第 7 步，流程暂停"); return
         lift=(contact[0],contact[1],contact[2]+.05,*contact[3:]); self.backend.send("arm_cartesian", left=left, right=lift, vel=.70, acc=.10); self._wait_right_tcp(lift); self.log("[8/10] 右手抬高 5 cm 完成")
         if max_step == 8: self.log("测试模式：已到第 8 步，流程暂停"); return
-        back=(lift[0],lift[1]-.15,lift[2],*lift[3:]) if special else (lift[0]-.15*math.cos(cur[5]),lift[1]-.15*math.sin(cur[5]),lift[2],*lift[3:]); self.backend.send("arm_cartesian", left=left, right=back, vel=.70, acc=.10); self._wait_right_tcp(back); self.log("[9/10] 右手后退 15 cm 完成")
+        back=(lift[0]-.15*math.cos(cur[5]),lift[1]-.15*math.sin(cur[5]),lift[2],*lift[3:]); self.backend.send("arm_cartesian", left=left, right=back, vel=.70, acc=.10); self._wait_right_tcp(back); self.log("[9/10] 右手后退 15 cm 完成")
         if max_step == 9: self.log("测试模式：已到第 9 步，流程暂停"); return
         waist=self.backend.snapshot().joint_state; wt={n:float(waist[n]) for n in LEG_JOINTS if n in waist};
         if len(wt)!=4: raise RuntimeError("腿部四个关节状态不完整")
@@ -369,7 +397,25 @@ class BoxGrasp(DirectLeftGrasp):
         snap = self.backend.snapshot(); left_j, right_j = (self.READY2_L, self.READY2_R) if layer == "SL" else (self.READY_L, self.READY_R)
         self.backend.send("arm_joint", left=left_j, right=right_j, vel=.40, acc=.10); self.wait_joints({f"ljoint{i}": left_j[i-1] for i in range(1,8)} | {f"rjoint{i}": right_j[i-1] for i in range(1,8)}); self.log("[BOX 2/8] 箱子初始姿态完成")
         if max_step == 2: return
-        values = LAYER_SL if layer == "SL" else LAYER_FL; self.backend.send("leg_joint", values=values, vel=.12, acc=.20); self.wait_joints({n: values[i] for i,n in enumerate(LEG_JOINTS)}); self.log("[BOX 3/8] 升降机高度完成")
+        if layer == "SL":
+            values = LAYER_SL
+            self.backend.send("leg_joint", values=values, vel=.12, acc=.20)
+            self.wait_joints({n: values[i] for i, n in enumerate(LEG_JOINTS)})
+            self.log("[BOX 3/8] 第二层升降机高度完成")
+        else:
+            # 第一层箱子抓取要求实际腿部末端高度为 0.400 m。
+            # 使用腿部笛卡尔升降保持当前姿态，只补偿高度，不再直接使用
+            # LAYER_FL（其正运动学高度约为 0.459 m）。
+            pose = self.backend.snapshot().leg_pose()
+            if not pose:
+                raise RuntimeError("当前腿部状态还没读全，无法调整第一层高度")
+            delta = 0.400 - float(pose["y"])
+            if abs(delta) > 1e-3:
+                self.backend.send("leg_lift", delta=delta, waist_delta=0.0, vel=.12)
+                self.wait(arm=False, leg=True, timeout=45.0)
+            final_pose = self.backend.snapshot().leg_pose()
+            actual_y = None if not final_pose else float(final_pose["y"])
+            self.log(f"[BOX 3/8] 第一层高度完成：目标 0.400m，实际 {actual_y:.3f}m" if actual_y is not None else "[BOX 3/8] 第一层高度完成")
         if max_step == 3: return
         gx, gy, gz = target_provider("xiangzi", self.BOX_MODEL); self.log(f"[BOX 4/8] 箱体识别位置 {gx:.3f},{gy:.3f},{gz:.3f}")
         if max_step == 4: return
@@ -390,8 +436,8 @@ class BoxGrasp(DirectLeftGrasp):
         if max_step == 5: return
         # 与主界面“右手前进”一致：从右手预抓取位姿只沿基座 X 轴前进，
         # 保持 Y/Z 和末端姿态不变，避免误沿箱体侧向 Y 轴移动。
-        right_final = (right_pre[0] + .11, right_pre[1], right_pre[2], *right_pre[3:])
-        self.backend.send("arm_cartesian", left=left_pre, right=right_final, vel=.70, acc=.10); self._wait_right_tcp_box(right_final); self.log("[BOX 6/8] 右手沿 X 轴单独前进 11cm 完成")
+        right_final = (right_pre[0] + .10, right_pre[1], right_pre[2], *right_pre[3:])
+        self.backend.send("arm_cartesian", left=left_pre, right=right_final, vel=.70, acc=.10); self._wait_right_tcp_box(right_final); self.log("[BOX 6/8] 右手沿 X 轴单独前进 10cm 完成")
         if max_step == 6: return
         self.gripper("close"); self.right_gripper("close"); self.log("[BOX 7/8] 左右手同步闭合完成")
         if max_step == 7: return
@@ -409,6 +455,73 @@ class BoxGrasp(DirectLeftGrasp):
             self.backend.send("leg_lift", delta=BOX_LIFT_DISTANCE_M, waist_delta=0.0, vel=.08)
             self.wait(arm=False, leg=True)
             self.log("[BOX 8/8] 第一层腰部上升 10cm 完成")
+    def place_hand(self, hand: str) -> None:
+        """按指定末端执行器执行固定坐标箱子放置流程。"""
+        hand = str(hand).lower()
+        if hand not in {"left", "right"}:
+            raise ValueError("放置手臂必须是 left 或 right")
+        self.cancelled = False
+        self.log(f"[BOX PLACE {hand}] 开始固定坐标放置流程")
+        snap = self.backend.snapshot()
+        if not snap.joint_state:
+            raise RuntimeError("尚未收到关节状态")
+
+        # 1. 双臂复位到 SECOND 姿态。
+        self.backend.send("arm_joint", left=SECOND_L, right=SECOND_R, vel=.70, acc=.50)
+        self.wait_joints(
+            {f"ljoint{i}": SECOND_L[i - 1] for i in range(1, 8)}
+            | {f"rjoint{i}": SECOND_R[i - 1] for i in range(1, 8)}
+        )
+        self.log(f"[BOX PLACE {hand}] 双臂 SECOND 姿态完成")
+
+        # 2. 腰部到 0.65 m：28.1, -57.1, 29.0, 0 度。
+        self.backend.send("leg_joint", values=PLACE_LEG_065, vel=.12, acc=.20)
+        self.wait_joints({n: PLACE_LEG_065[i] for i, n in enumerate(LEG_JOINTS)})
+        self.log(f"[BOX PLACE {hand}] 腰部 0.65m 高度完成")
+
+        # 3. 指定 TCP 到 car_link 固定坐标，保留复位后的末端姿态。
+        current = self.backend.snapshot()
+        left_now = self.pose(current.left_ee)
+        right_now = self.pose(current.right_ee)
+        target = (*PLACE_XYZ, *(left_now[3:] if hand == "left" else right_now[3:]))
+        if hand == "left":
+            self.backend.send("arm_cartesian", left=target, right=right_now, vel=.30, acc=.08)
+            self.wait_left_tcp(target)
+        else:
+            self.backend.send("arm_cartesian", left=left_now, right=target, vel=.30, acc=.08)
+            self._wait_right_tcp_box(target)
+        self.log(f"[BOX PLACE {hand}] TCP 已到 car_link (0.40, 0.00, 1.10)")
+
+        # 4. 指定 TCP 沿基座 Z 轴下降 10 cm。
+        drop = (target[0], target[1], target[2] - PLACE_Z_DROP_M, *target[3:])
+        if hand == "left":
+            self.backend.send("arm_cartesian", left=drop, right=right_now, vel=.30, acc=.08)
+            self.wait_left_tcp(drop)
+        else:
+            self.backend.send("arm_cartesian", left=left_now, right=drop, vel=.30, acc=.08)
+            self._wait_right_tcp_box(drop)
+        self.log(f"[BOX PLACE {hand}] 指定末端沿基座 Z 轴下降 10cm")
+
+        # 5. 只打开被点击按钮对应的末端执行器。
+        if hand == "left":
+            self.gripper("open")
+        else:
+            self.right_gripper("open")
+        self.log(f"[BOX PLACE {hand}] {'左夹爪' if hand == 'left' else '右灵巧手'} 已打开")
+
+        # 6. 腰部保持 0.65 m，第四个关节 hip_yaw_joint 为 0。
+        self.backend.send("leg_joint", values=PLACE_LEG_065, vel=.12, acc=.20)
+        self.wait_joints({n: PLACE_LEG_065[i] for i, n in enumerate(LEG_JOINTS)})
+        self.log(f"[BOX PLACE {hand}] 腰部保持 0.65m，第四关节归零")
+
+        # 7. 双臂复位到 SECOND 姿态。
+        self.backend.send("arm_joint", left=SECOND_L, right=SECOND_R, vel=.70, acc=.50)
+        self.wait_joints(
+            {f"ljoint{i}": SECOND_L[i - 1] for i in range(1, 8)}
+            | {f"rjoint{i}": SECOND_R[i - 1] for i in range(1, 8)}
+        )
+        self.log(f"[BOX PLACE {hand}] 双臂复位完成")
+
     def _wait_right_tcp_box(self, target, timeout=45.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -417,3 +530,78 @@ class BoxGrasp(DirectLeftGrasp):
             if math.sqrt(sum((cur[i]-target[i])**2 for i in range(3))) <= .01: return
             time.sleep(.2)
         raise TimeoutError(f"右 TCP 到位超时：目标={target[:3]}")
+
+    def place(self, layer: str, max_step: int = 8) -> None:
+        """放置箱子。
+
+        第一层：双手直接下降 6 cm。
+        第二层：双手先下降 5 cm，腰部调整到 0.400 m，再双手下降 6.2 cm。
+        ``max_step`` 用于网页调试时在各阶段后暂停。
+        """
+        max_step = max(1, min(8, int(max_step)))
+        layer = str(layer).upper()
+        self.cancelled = False
+        if layer not in {"FL", "SL"}:
+            raise ValueError(f"不支持的箱子层：{layer}")
+        snap = self.backend.snapshot()
+        if snap.left_ee is None or snap.right_ee is None:
+            raise RuntimeError("当前末端姿态未就绪，无法执行箱子放置")
+
+        def drop_both(distance_m: float, label: str) -> None:
+            current = self.backend.snapshot()
+            left_now = self.pose(current.left_ee)
+            right_now = self.pose(current.right_ee)
+            left_drop = (left_now[0], left_now[1], left_now[2] - distance_m, *left_now[3:])
+            right_drop = (right_now[0], right_now[1], right_now[2] - distance_m, *right_now[3:])
+            self.backend.send("arm_cartesian", left=left_drop, right=right_drop, vel=0.05, acc=0.10)
+            self.wait_left_tcp(left_drop, timeout=45.0)
+            self._wait_right_tcp_box(right_drop, timeout=45.0)
+            self.log(f"[BOX PLACE] {label}：双手同步下降 {distance_m:.3f}m 完成")
+
+        def open_both() -> None:
+            """下降确认完成后释放箱子：左夹爪打开，右手回到箱子张开姿态。"""
+            self.gripper("open")
+            # grasp box 页“灵巧手姿势”对应的张开姿态，不使用通用 preset，
+            # 以确保右手发送 [100, 0, 255, 255, 255, 255, 255]。
+            self.right_pose(BOX_HAND_POSE)
+            self.log("[BOX PLACE] 左右手已打开，右手姿态=100 0 255 255 255 255 255")
+
+        def lower_right_after_open() -> None:
+            """确认双手释放后，右臂 TCP 再沿基座 Z 轴下降 1 cm。"""
+            current = self.backend.snapshot()
+            left_now = self.pose(current.left_ee)
+            right_now = self.pose(current.right_ee)
+            right_lower = (right_now[0], right_now[1], right_now[2] - 0.010, *right_now[3:])
+            # 左臂保持当前位置，右臂单独下降；等待右 TCP 到位后才结束放置流程。
+            self.backend.send("arm_cartesian", left=left_now, right=right_lower, vel=0.05, acc=0.08)
+            self._wait_right_tcp_box(right_lower, timeout=45.0)
+            self.log("[BOX PLACE] 双手打开完成，右臂末端沿 Z 轴下降 1cm 完成")
+
+        if layer == "FL":
+            drop_both(BOX_PLACE_DROP_FIRST_LAYER_M, "第一层")
+            open_both()
+            lower_right_after_open()
+            return
+
+        # 第二层第一阶段：先把箱子整体向下放 5 cm。
+        drop_both(0.050, "第二层第 1 步")
+        if max_step == 1:
+            return
+
+        # 第二层第二阶段：再将腰部/升降机构调整到 0.400 m。
+        pose = self.backend.snapshot().leg_pose()
+        if not pose:
+            raise RuntimeError("当前腿部状态还没读全，无法执行第二层放箱子")
+        current_y = float(pose["y"])
+        delta = 0.400 - current_y
+        if abs(delta) > 1e-3:
+            self.backend.send("leg_lift", delta=delta, waist_delta=0.0, vel=0.12)
+            self.wait(arm=False, leg=True, timeout=45.0)
+        self.log("[BOX PLACE] 第二层第 2 步：腰部已到位 0.400m")
+        if max_step == 2:
+            return
+
+        # 第二层第三阶段：腰部到位后，双手再下降 6.2 cm。
+        drop_both(BOX_PLACE_DROP_SECOND_LAYER_M, "第二层第 3 步")
+        open_both()
+        lower_right_after_open()

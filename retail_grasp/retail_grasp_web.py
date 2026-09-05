@@ -167,6 +167,27 @@ class Controller:
         if self.running: raise RuntimeError("已有任务运行中")
         self.running = True; self._thread = threading.Thread(target=self._workflow, args=(item, max_step), daemon=True); self._thread.start()
 
+    def start_box_place_hand(self, hand: str) -> None:
+        if self.running: raise RuntimeError("已有任务运行中")
+        hand = str(hand).lower()
+        if hand not in {"left", "right"}: raise ValueError("放置手臂必须是 left 或 right")
+        self.running = True
+        self._thread = threading.Thread(target=self._box_place_hand_workflow, args=(hand,), daemon=True)
+        self._thread.start()
+
+    def _box_place_hand_workflow(self, hand: str) -> None:
+        try:
+            if not self.backend: raise RuntimeError("ROS 控制器未初始化")
+            if not self._startup_done.wait(timeout=30.0):
+                raise TimeoutError("等待启动末端自检结束超时")
+            if self._startup_error:
+                raise RuntimeError(f"启动末端自检失败，未执行任务: {self._startup_error}")
+            self.box_grasp.place_hand(hand)
+        except Exception as exc:
+            self.log(f"{hand}手放置流程失败：{exc}")
+        finally:
+            self.running = False
+
     def stop(self) -> None:
         self.running = False; self.log("自动抓取已停止")
         if hasattr(self, "grasp"): self.grasp.stop()
@@ -244,14 +265,36 @@ def start(name: str, hand: str = "left", max_step: int = 11):
 def box_action(layer: str, action: str, max_step: int = 8):
     if layer not in {"FL", "SL"} or action not in {"grasp", "place"}:
         return {"ok": False, "error": "参数必须是 layer=FL/SL、action=grasp/place"}
-    if action == "place":
-        return {"ok": False, "error": "放置箱子流程暂未实现"}
     item = next(x for x in boxes if x["box_layer"] == layer)
     if controller.running: return {"ok": False, "error": "已有任务运行中"}
     if not 1 <= max_step <= 8: return {"ok": False, "error": "max_step 必须是 1 到 8"}
-    controller.log(f"收到箱子抓取任务：{item['name']}，最大执行步骤={max_step}")
-    controller.start(item, "left", max_step)
-    return {"ok": True, "max_step": max_step}
+    controller.log(f"收到箱子{action}任务：{item['name']}，最大执行步骤={max_step}")
+    try:
+        if action == "grasp":
+            controller.start(item, "left", max_step)
+        else:
+            controller.box_grasp.place(layer, max_step)
+        return {"ok": True, "max_step": max_step, "action": action}
+    except Exception as exc:
+        controller.log(f"箱子{action}失败：{exc}")
+        return {"ok": False, "error": str(exc)}
+
+@app.post("/api/box-hand-place/{hand}")
+def box_place_hand(hand: str):
+    """新增的左右手固定坐标放置入口；具体动作在线程中执行。"""
+    hand = str(hand).lower()
+    if hand not in {"left", "right"}:
+        return {"ok": False, "error": "hand 必须是 left 或 right"}
+    if controller.running:
+        return {"ok": False, "error": "已有任务运行中"}
+    controller.log(f"收到{hand}手放置任务")
+    try:
+        controller.start_box_place_hand(hand)
+        return {"ok": True, "hand": hand}
+    except Exception as exc:
+        controller.log(f"{hand}手放置任务启动失败：{exc}")
+        return {"ok": False, "error": str(exc)}
+
 @app.post("/api/stop")
 def stop(): controller.stop(); return {"ok": True}
 @app.websocket("/ws")

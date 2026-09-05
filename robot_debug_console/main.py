@@ -1784,9 +1784,14 @@ class DmpMainWindow(QtWidgets.QMainWindow):
         left_port = self.final_gripper_port_input.text().strip() or LEFT_GRIPPER_PORT
         right_port = self.final_o7_port_input.text().strip() or O7_RS485_PORT
         left_command = [sys.executable, "-u", str(LEFT_GRIPPER_SCRIPT), "--port", left_port, f"--{action}-once"]
+        right_pose_args = (
+            ["--preset", "fist"]
+            if action == "close"
+            else ["--position", "100", "0", "255", "255", "255", "255", "255"]
+        )
         right_command = [
             sys.executable, "-u", str(O7_RS485_SCRIPT), "--port", right_port,
-            "--hand_type", "right", "--once", "--preset", "fist" if action == "close" else "open",
+            "--hand_type", "right", "--once", *right_pose_args,
             "--no-open-on-exit",
         ]
         processes: list[QtCore.QProcess] = []
