@@ -4,7 +4,7 @@
 网页不嵌入旧调试界面；抓取流程由 retail_grasp_controller 独立执行。
 """
 from __future__ import annotations
-import asyncio, os, threading, time, subprocess, sys
+import asyncio, os, threading, time, subprocess, sys, json
 from pathlib import Path
 from typing import Any
 import yaml
@@ -12,7 +12,10 @@ from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 import uvicorn
-from retail_grasp_controller import DirectLeftGrasp, DirectRightGrasp, BoxGrasp, RetailVision
+from retail_grasp_controller import (
+    DirectLeftGrasp, DirectRightGrasp, BoxGrasp, RetailVision,
+    RESET_L, RESET_R, LAYER_FL, LAYER_SL,
+)
 
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parent
@@ -20,6 +23,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 RIGHT_HAND_SCRIPT = PROJECT_ROOT.parent / "linkhand" / "linker_hand_python_sdk" / "example" / "o7_rs485_control.py"
 LEFT_GRIPPER_SCRIPT = PROJECT_ROOT / "omni_picker_rs485_test.py"
+# 零售抓取链路左夹爪闭合力度（OmniPicker 协议范围 0..255）。
+LEFT_GRIPPER_FORCE = 255
 CATALOG = PROJECT_ROOT / "config" / "grasp_catalog.yaml"
 app = FastAPI(title="Retail Grasp Console")
 app.mount("/static", StaticFiles(directory=str(ROOT / "static")), name="static")
@@ -106,11 +111,26 @@ class Controller:
         if not self.backend: raise RuntimeError("ROS 控制器未初始化")
         self.backend.send("power", enable=enable); self.log("上使能已发送" if enable else "下使能已发送")
 
+    def manual_arm_command(self, action: str) -> None:
+        """执行网页上的独立复位/高度命令，不启动商品抓取流程。"""
+        if self.running: raise RuntimeError("自动抓取运行中，暂时不能执行复位或高度命令")
+        if not self.backend: raise RuntimeError("ROS 控制器未初始化")
+        if action == "reset":
+            self.backend.send("arm_joint", left=RESET_L, right=RESET_R, vel=.70, acc=.50)
+            self.log("已发送机械臂复位命令（第一层抓取复位姿态）")
+        elif action == "layer-fl":
+            self.backend.send("leg_joint", values=LAYER_FL, vel=.12, acc=.20)
+            self.log("已发送第一层高度命令")
+        elif action == "layer-sl":
+            self.backend.send("leg_joint", values=LAYER_SL, vel=.12, acc=.20)
+            self.log("已发送第二层高度命令")
+        else: raise ValueError("未知机械臂命令")
+
     def gripper(self, hand: str, action: str) -> None:
         if action not in {"close", "open"}: raise RuntimeError("动作必须是 close 或 open")
         if hand == "left":
             port = os.environ.get("LEFT_GRIPPER_PORT", "/dev/ttyS2")
-            command = [sys.executable, "-u", str(LEFT_GRIPPER_SCRIPT), "--port", port, f"--{'close' if action == 'close' else 'open'}-once"]
+            command = [sys.executable, "-u", str(LEFT_GRIPPER_SCRIPT), "--port", port, f"--{'close' if action == 'close' else 'open'}-once", "--force", str(LEFT_GRIPPER_FORCE)]
         elif hand == "right":
             port = os.environ.get("RIGHT_HAND_PORT", "/dev/ttyS3")
             command = [sys.executable, "-u", str(RIGHT_HAND_SCRIPT), "--port", port, "--hand_type", "right", "--once", "--preset", "fist" if action == "close" else "open", "--no-open-on-exit"]
@@ -165,12 +185,22 @@ class Controller:
 
     def start(self, item: dict[str, Any], hand: str = "left", max_step: int = 11) -> None:
         if self.running: raise RuntimeError("已有任务运行中")
-        self.running = True; self._thread = threading.Thread(target=self._workflow, args=(item, max_step), daemon=True); self._thread.start()
+        hand = str(hand).lower()
+        if hand not in {"left", "right"}: raise ValueError("抓取手臂必须是 left 或 right")
+        # 仅覆盖本次任务选择的手臂，不改动目录数据及其余抓取参数。
+        task_item = dict(item)
+        task_item["hand"] = hand
+        # stop() 会将流程对象标记为 cancelled；新任务开始前必须清除旧状态。
+        self.grasp.cancelled = False
+        self.right_grasp.cancelled = False
+        self.box_grasp.cancelled = False
+        self.running = True; self._thread = threading.Thread(target=self._workflow, args=(task_item, max_step), daemon=True); self._thread.start()
 
     def start_box_place_hand(self, hand: str) -> None:
         if self.running: raise RuntimeError("已有任务运行中")
         hand = str(hand).lower()
         if hand not in {"left", "right"}: raise ValueError("放置手臂必须是 left 或 right")
+        self.box_grasp.cancelled = False
         self.running = True
         self._thread = threading.Thread(target=self._box_place_hand_workflow, args=(hand,), daemon=True)
         self._thread.start()
@@ -213,9 +243,13 @@ controller = Controller()
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    return (ROOT / "retail_grasp_web.html").read_text(encoding="utf-8")
+    # 禁止浏览器复用旧页面，确保前端选择层修改立即生效。
+    return HTMLResponse(
+        (ROOT / "retail_grasp_web.html").read_text(encoding="utf-8"),
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 @app.get("/api/products")
-def get_products(): return products
+def get_products(): return Response(content=json.dumps(products, ensure_ascii=False), media_type="application/json", headers={"Cache-Control": "no-store"})
 @app.get("/api/boxes")
 def get_boxes(): return boxes
 @app.get("/api/status")
@@ -242,6 +276,15 @@ def camera_status():
             "logs": [x for x in controller.logs if "相机" in x or "camera" in x.lower()][-5:]}
 @app.post("/api/power/{enable}")
 def set_power(enable: bool): controller.power(enable); return {"ok": True}
+@app.post("/api/arm/{action}")
+def arm_command(action: str):
+    if action not in {"reset", "layer-fl", "layer-sl"}:
+        return {"ok": False, "error": "命令必须是 reset、layer-fl 或 layer-sl"}
+    try:
+        controller.manual_arm_command(action)
+        return {"ok": True, "action": action}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
 @app.post("/api/gripper/{hand}/{action}")
 def gripper(hand: str, action: str):
     if controller.running:
@@ -257,9 +300,15 @@ def gripper(hand: str, action: str):
 def start(name: str, hand: str = "left", max_step: int = 11):
     item = next((x for x in products + boxes if x.get("name") == name), None)
     if not item: return {"ok": False, "error": "商品不存在"}
+    hand = str(hand).lower()
+    if hand not in {"left", "right"}:
+        return {"ok": False, "error": "抓取手臂必须是 left 或 right"}
+    # 瓜子、脆升升、派为右手特殊商品，始终锁定右手。
+    if str(item.get("label", "")).lower() in {"guazi", "cui", "pai"} and hand != "right":
+        return {"ok": False, "error": "该特殊商品只能使用右手抓取"}
     if not 1 <= max_step <= 10:
         return {"ok": False, "error": "max_step 必须是 1 到 10"}
-    controller.log(f"收到调试任务：{name}，最大执行步骤={max_step}")
+    controller.log(f"收到调试任务：{name}，{('左' if hand == 'left' else '右')}手，最大执行步骤={max_step}")
     controller.start(item, hand, max_step); return {"ok": True, "max_step": max_step}
 @app.post("/api/box/{layer}/{action}")
 def box_action(layer: str, action: str, max_step: int = 8):
